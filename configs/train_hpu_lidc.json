@@ -1,0 +1,18 @@
+{
+  "seed": 42,
+  "total_steps": 240000,
+  "batch_size": 8,
+  "lr": 0.0001,
+  "lr_milestones": [160000, 200000],
+  "lr_gamma": 0.1,
+  "optimizer": "adam",
+  "weight_decay": 0.0,
+  "use_topk": true,
+  "k_frac": 0.02,
+  "recon_strategy": "random",
+  "geco": { "kappa": 0.60, "alpha": 0.99, "lambda_init": 1.0, "step_size": 0.05 },
+  "eval_every_steps": 5000,
+  "ckpt_every_steps": 10000,
+  "num_workers": 2,
+  "augment": true
+}

@@ -1,0 +1,19 @@
+{
+  "seed": 42,
+  "total_steps": 240000,
+  "batch_size": 16,
+  "lr": 0.0001,
+  "lr_milestones": [160000, 200000],
+  "lr_gamma": 0.1,
+  "optimizer": "adam",
+  "weight_decay": 0.0,
+  "use_topk": false,
+  "k_frac": 0.02,
+  "recon_strategy": "random",
+  "eval_every_steps": 5000,
+  "ckpt_every_steps": 10000,
+  "num_workers": 2,
+  "augment": true,
+  "pos_weight": "auto",
+  "pos_weight_clip": 20.0
+}
