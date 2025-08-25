@@ -7,6 +7,6 @@ exec "$PY" -m hpunet.train.train_spu \
   --config configs/train_spu_lidc.json \
   --project-root "$(pwd)" \
   --data-root "data/lidc_crops" \
-  --max-steps 500 \
-  --outdir "runs/spu_smoke" \
+  --max-steps 2000 \
+  --outdir "runs/spu_2000" \
   --save-name "spu_last.pth"

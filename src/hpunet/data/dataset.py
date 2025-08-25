@@ -9,7 +9,8 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .transforms import RandomAffine2D
+# from .transforms import RandomAffine2D
+from .transforms import build_default_transform
 
 
 def _load_png_grayscale(path: Path) -> np.ndarray:
@@ -61,7 +62,7 @@ class LIDCCropsDataset(Dataset):
         # minimal augmenter (rotation/scale/translation + flips) if augment=True
         self.transform = transform
         if self.augment and self.transform is None:
-            self.transform = RandomAffine2D()
+            self.transform = build_default_transform()
 
         self.df = pd.read_csv(self.csv_path)
         required_cols = [

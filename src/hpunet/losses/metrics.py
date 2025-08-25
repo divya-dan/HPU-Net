@@ -56,7 +56,7 @@ def hungarian_matched_iou(gt_set: Tensor, pred_set: Tensor) -> float:
     return float(matched_ious.mean().item())
 
 
-def ged2(gt_set: Tensor, pred_set: Tensor, clip_zero: bool = True) -> float:
+def ged2(gt_set: Tensor, pred_set: Tensor, clip_zero: bool = False) -> float:
     """
     Generalized Energy Distance squared with d = 1 - IoU.
     Uses the unbiased U-statistic estimator (can be < 0 due to finite samples).

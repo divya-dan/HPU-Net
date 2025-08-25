@@ -1,16 +1,17 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from mimetypes import init
 from typing import Optional, Dict, Any
 import torch
 
 @dataclass
 class GECOConfig:
-    kappa: float = 0.05     # target reconstruction level
-    alpha: float = 0.99     # EMA factor for the constraint C = recon - kappa
+    kappa: float = 0.05     
+    alpha: float = 0.99     
     lambda_init: float = 1.0
     min_log_lambda: float = -8.0
     max_log_lambda: float = 8.0
-    step_size: float = 1.0  # update scale for log_lambda (1.0 per GECO paper)
+    step_size: float = 0.01  # CHANGE: was 0.1, should be 0.01
 
 class GECO:
     """
@@ -22,7 +23,8 @@ class GECO:
     def __init__(self, cfg: GECOConfig):
         self.cfg = cfg
         # work in log-space for numerical stability
-        self.log_lambda = torch.tensor(float(torch.log(torch.tensor(cfg.lambda_init))), dtype=torch.float32)
+        init = max(1e-8, float(cfg.lambda_init))
+        self.log_lambda = torch.tensor(float(torch.log(torch.tensor(init))), dtype=torch.float32)
         self.ema_c = torch.tensor(0.0, dtype=torch.float32)
         self._device = torch.device("cpu")
 
