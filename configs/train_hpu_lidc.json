@@ -1,7 +1,7 @@
 {
   "seed": 42,
   "total_steps": 240000,
-  "batch_size": 16,
+  "batch_size": 32,
   "lr": 0.0001,
   "lr_milestones": [60000, 120000, 180000, 210000],
   "lr_gamma": 0.5,

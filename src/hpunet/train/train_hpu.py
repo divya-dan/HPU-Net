@@ -132,7 +132,7 @@ def main():
         pm = batch["pad_mask"].to(device, non_blocking=True)    # [B,H,W]
 
         # Choose target grader
-        y_target, _ = select_targets_from_graders(y_all, strategy=recon_strategy)
+        y_target, target_info = select_targets_from_graders(y_all, strategy=recon_strategy)
 
         # Forward with posterior sampling (training)
         logits, info = model(x, y_target=y_target, sample_posterior=True)

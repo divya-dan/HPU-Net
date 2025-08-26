@@ -2,6 +2,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from .unet_blocks import ResStack, ResDown, ResUp
 
 def gaussian_kl_spatial(mu_q, lv_q, mu_p, lv_p) -> torch.Tensor:
     """KL(q||p) for diagonal Gaussians over (C,H,W), return [B]"""
@@ -62,8 +63,6 @@ class ResUNet8ScaleEncoder(nn.Module):
         C7 = _cap(base * 64)     # 192 (capped)
         C8 = _cap(base * 128)    # 192 (capped)
 
-        # Import the ResNet blocks from your existing unet_blocks.py
-        from .unet_blocks import ResStack, ResDown
         
         self.enc1  = ResStack(in_ch, C1, n_blocks)  # 128x128
         self.down1 = ResDown(C1, C2, n_blocks)      # 64x64
@@ -92,8 +91,6 @@ class ResUNet8ScaleDecoder(nn.Module):
     def __init__(self, chans: tuple, n_blocks: int = 3):
         super().__init__()
         C1, C2, C3, C4, C5, C6, C7, C8 = chans
-        
-        from .unet_blocks import ResUp
         
         self.up7 = ResUp(C8, C7, C7, n_blocks)  # 1x1 + 2x2 -> 2x2
         self.up6 = ResUp(C7, C6, C6, n_blocks)  # 2x2 + 4x4 -> 4x4

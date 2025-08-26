@@ -32,14 +32,7 @@ def load_model(ckpt_path: Path, device: torch.device) -> sPUNet:
     
     # Extract model config from checkpoint
     cfg = ckpt.get('cfg', {})
-    model_cfg = cfg.get('model', {})
-    
-    # Initialize sPUNet with same config as training
-    model = sPUNet(
-        in_ch=1,
-        base=model_cfg.get('base', 32),      # sPUNet uses base=32
-        z_dim=model_cfg.get('z_dim', 6)      # sPUNet uses 6 global latents
-    ).to(device)
+    model = sPUNet(in_ch=1, base=32, z_dim=6).to(device)  # Use sPUNet spec defaults
     
     # Load weights
     model.load_state_dict(ckpt['model'])

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 # returns: per-image SUMS (shape [B]) and per-image COUNTS (shape [B])
 def masked_bce_sum_per_image(logits, target, pad_mask, pos_weight=None):
     # logits,target: [B,1,H,W]; pad_mask: [B,H,W] (bool/byte)
-    bce = nn.functional.binary_cross_entropy_with_logits(
+    bce = F.binary_cross_entropy_with_logits(
         logits, target, reduction='none', pos_weight=pos_weight
     ).squeeze(1)                                   # [B,H,W]
     valid = pad_mask.bool()
@@ -16,7 +16,7 @@ def masked_bce_sum_per_image(logits, target, pad_mask, pos_weight=None):
     return sums, counts
 
 def masked_topk_bce_sum_per_image(logits, target, pad_mask, k_frac=0.02, pos_weight=None):
-    bce = nn.functional.binary_cross_entropy_with_logits(
+    bce = F.binary_cross_entropy_with_logits(
         logits, target, reduction='none', pos_weight=pos_weight
     ).squeeze(1)                                   # [B,H,W]
     valid = pad_mask.bool()

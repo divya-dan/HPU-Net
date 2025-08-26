@@ -31,16 +31,8 @@ def load_model(ckpt_path: Path, device: torch.device) -> HPUNet:
     
     # Extract model config from checkpoint
     cfg = ckpt.get('cfg', {})
-    model_cfg = cfg.get('model', {})
-    
-    # Initialize model with same config as training
-    model = HPUNet(
-        in_ch=1,
-        base=model_cfg.get('base', 24),
-        z_ch=model_cfg.get('z_ch', 1), 
-        n_blocks=model_cfg.get('n_blocks', 3)
-    ).to(device)
-    
+    model = HPUNet(in_ch=1, base=24, z_ch=1, n_blocks=3).to(device)  # Use spec defaults
+
     # Load weights
     model.load_state_dict(ckpt['model'])
     model.eval()
@@ -160,7 +152,7 @@ def create_visualization_grid_style1(
     for i in range(24):
         row = 2 + (i // 8)  # Start from row 3 (index 2)
         col = (i % 8) + 1   # Columns 1-8
-        subplot_idx = row * 8 + col
+        subplot_idx = (row * 8) + col + 1  # matplotlib subplots are 1-indexed
         add_subplot_with_title(subplot_idx, samples[i], f"s{i+1}")
     
     plt.tight_layout()
