@@ -226,10 +226,14 @@ def main():
             torch.save({
                 "step": step, 
                 "model": model.state_dict(), 
-                "geco": geco.state_dict(),
+                "geco": {  # Manual GECO state extraction
+                    "log_lambda": geco.log_lambda,
+                    "ema_c": geco.ema_c,
+                    "cfg": asdict(geco.cfg)
+                },
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
-                "cfg": cfg_to_save if 'cfg_to_save' in locals() else (asdict(cfg) if is_dataclass(cfg) else vars(cfg))
+                "cfg": cfg_to_save
             }, ckpt_path)
             print(f"Checkpoint saved at step {step}: {ckpt_path}")
 
@@ -243,7 +247,11 @@ def main():
     torch.save({
         "step": int(max_steps), 
         "model": model.state_dict(), 
-        "geco": geco.state_dict(),
+        "geco": {
+            "log_lambda": geco.log_lambda,
+            "ema_c": geco.ema_c, 
+            "cfg": asdict(geco.cfg)
+        },
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "cfg": cfg_to_save
