@@ -46,7 +46,7 @@ def main():
     ap.add_argument("--project-root", type=Path, default=Path.cwd(), help="Project root directory")
     ap.add_argument("--data-root", type=Path, default=None, help="Data root directory")
     ap.add_argument("--max-steps", type=int, default=None, help="Max training steps (overrides config)")
-    ap.add_argument("--beta", type=float, default=None, help="ELBO beta for KL term (overrides config)")
+    # ap.add_argument("--beta", type=float, default=None, help="ELBO beta for KL term (overrides config)")
     ap.add_argument("--outdir", type=Path, default=Path("runs/spu"), help="Output directory")
     ap.add_argument("--save-name", type=str, default="spu_last.pth", help="Final checkpoint name")
     args = ap.parse_args()
@@ -63,7 +63,7 @@ def main():
     ckpt_every_steps = getattr(cfg, 'ckpt_every_steps', 10000)
     
     # ELBO beta parameter
-    beta = args.beta if args.beta is not None else getattr(cfg, 'beta', 1.0)
+    # beta = args.beta if args.beta is not None else getattr(cfg, 'beta', 1.0)
 
     data_root = args.data_root or (args.project_root / "data" / "lidc_crops")
     train_csv = data_root / "train.csv"
@@ -86,7 +86,7 @@ def main():
     )
 
     # FIXED: Model with correct parameters for sPUNet
-    model = sPUNet(in_ch=1, base=32, z_dim=6).to(device)
+    model = sPUNet(in_ch=1, base=32, z_dim=16).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Optimizer and scheduler
@@ -114,7 +114,7 @@ def main():
     print(f"  Max steps: {max_steps:,}")
     print(f"  Batch size: {cfg.batch_size}")
     print(f"  Learning rate: {cfg.lr}")
-    print(f"  ELBO beta: {beta}")
+    # print(f"  ELBO beta: {beta}")
     print(f"  Dataset: {len(train_ds)} training examples")
 
     model.train()
@@ -138,8 +138,8 @@ def main():
         # Forward pass: sample from posterior q(z|x,y) during training
         logits, info = model(x, y_target=y_target, sample_posterior=True)
 
-        # FIXED: Extract KL divergence (use consistent key)
-        kl = info.get("KL_sum", torch.tensor(0.0, device=device))
+        # Extract and handle KL divergence like working script
+        kl = info.get("kl", torch.tensor(0.0, device=device))
         if isinstance(kl, torch.Tensor) and kl.ndim > 0:
             kl = kl.mean()
 
@@ -150,11 +150,19 @@ def main():
         elif isinstance(posw_mode, (int, float)):
             pos_weight = torch.tensor([float(posw_mode)], device=device)
 
-        # Reconstruction loss: mean BCE over valid pixels
+        # Reconstruction loss with proper aggregation
         recon = masked_bce_with_logits(logits, y_target, pm, pos_weight=pos_weight)
+        if isinstance(recon, torch.Tensor) and recon.ndim > 0:
+            recon = recon.mean()
 
-        # ELBO loss: L = E[recon] + β * KL(q||p) 
-        loss = recon + beta * kl
+        # Simple ELBO loss (no beta weighting)
+        loss = recon + kl
+
+        # Early debugging and KL collapse detection
+        if step % 1000 == 0:
+            print(f"  Debug - recon: {float(recon):.6f}, kl: {float(kl):.6f}")
+            if float(kl) < 0.001:
+                print(f"  WARNING: KL collapse detected!")
 
         # Optimization step
         optimizer.zero_grad(set_to_none=True)
@@ -169,7 +177,6 @@ def main():
             "train/recon": float(recon),
             "train/kl": float(kl),
             "train/lr": lr,
-            "train/beta": beta,
         })
 
         # Running averages for console output
@@ -203,6 +210,7 @@ def main():
         if step % eval_every_steps == 0:
             print(f"[step {step:5d}] Evaluation placeholder (add validation logic here)")
             # TODO: Add validation loop here if you have validation data
+
 
     # Save final checkpoint
     ckpt_path = args.outdir / args.save_name

@@ -352,7 +352,7 @@ class sPUNet(nn.Module):
             "mu_q": mu_q, "logvar_q": logvar_q,
             "z": z,
             "kl": kl,           # [B] - per sample KL
-            "KL_sum": kl_sum    # Scalar - mean KL for loss
+            # "KL_sum": kl_sum    # Scalar - mean KL for loss
         }
 
         return logits, info

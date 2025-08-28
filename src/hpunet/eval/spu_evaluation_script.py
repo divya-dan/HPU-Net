@@ -32,7 +32,7 @@ from hpunet.utils.config import load_config
 def load_model(ckpt_path: Path, device: torch.device) -> sPUNet:
     ckpt = torch.load(ckpt_path, map_location=device)
     # NOTE: adjust defaults if your sPUNet signature differs
-    model = sPUNet(in_ch=1, base=32, z_dim=6).to(device)
+    model = sPUNet(in_ch=1, base=32, z_dim=16).to(device)
     model.load_state_dict(ckpt["model"])  # expects key 'model'
     model.eval()
     print(f"Loaded sPUNet from step {ckpt.get('step', 'unknown')}")
