@@ -1,4 +1,4 @@
-# spu_net.py - CORRECTED IMPLEMENTATION
+# spu_net.py - CORRECTED IMPLEMENTATION WITH BATCH NORMALIZATION
 from __future__ import annotations
 from typing import Tuple, Dict, Any, Optional
 import torch
@@ -23,17 +23,19 @@ def gaussian_kl(mu_q, logvar_q, mu_p, logvar_p) -> torch.Tensor:
 
 
 # ============================================================================
-# STANDARD U-NET COMPONENTS (NOT ResNet - for sPUNet only)
+# STANDARD U-NET COMPONENTS WITH BATCH NORMALIZATION
 # ============================================================================
 
 def standard_conv_block(in_ch: int, out_ch: int, k: int = 3, p: int = 1) -> nn.Sequential:
-    """Standard conv block: 3 × (3x3 Conv + ReLU) as per sPUNet paper spec"""
+    """Standard conv block with BatchNorm: 3 × (3x3 Conv + BN + ReLU)"""
     return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=p, bias=True),
+        nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=p, bias=False),  # No bias with BN
+        nn.BatchNorm2d(out_ch),
         nn.ReLU(inplace=True),
-        nn.Conv2d(out_ch, out_ch, kernel_size=k, padding=p, bias=True),
+        nn.Conv2d(out_ch, out_ch, kernel_size=k, padding=p, bias=False),
+        nn.BatchNorm2d(out_ch),
         nn.ReLU(inplace=True),
-        nn.Conv2d(out_ch, out_ch, kernel_size=k, padding=p, bias=True),
+        nn.Conv2d(out_ch, out_ch, kernel_size=k, padding=p, bias=True),   # Keep bias on final layer
         nn.ReLU(inplace=True),
     )
 
@@ -123,7 +125,7 @@ class StandardUNetDecoder(nn.Module):
 
 
 # ============================================================================
-# sPUNet COMPONENTS
+# sPUNet COMPONENTS WITH BATCH NORMALIZATION
 # ============================================================================
 
 class PriorNetwork(nn.Module):
@@ -140,11 +142,11 @@ class PriorNetwork(nn.Module):
         # Global average pooling + linear layers for latent parameters
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.mu_head = nn.Sequential(
-            nn.Linear(C5, C5), nn.ReLU(inplace=True),
+            nn.Linear(C5, C5), nn.BatchNorm1d(C5), nn.ReLU(inplace=True),
             nn.Linear(C5, z_dim)
         )
         self.logvar_head = nn.Sequential(
-            nn.Linear(C5, C5), nn.ReLU(inplace=True),
+            nn.Linear(C5, C5), nn.BatchNorm1d(C5), nn.ReLU(inplace=True),
             nn.Linear(C5, z_dim)
         )
 
@@ -174,11 +176,11 @@ class PosteriorNetwork(nn.Module):
         # Global average pooling + linear layers
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.mu_head = nn.Sequential(
-            nn.Linear(C5, C5), nn.ReLU(inplace=True),
+            nn.Linear(C5, C5), nn.BatchNorm1d(C5), nn.ReLU(inplace=True),
             nn.Linear(C5, z_dim)
         )
         self.logvar_head = nn.Sequential(
-            nn.Linear(C5, C5), nn.ReLU(inplace=True),
+            nn.Linear(C5, C5), nn.BatchNorm1d(C5), nn.ReLU(inplace=True),
             nn.Linear(C5, z_dim)
         )
 
@@ -196,19 +198,25 @@ class PosteriorNetwork(nn.Module):
 
 class CombinerNetwork(nn.Module):
     """
-    Combiner network: 3 final 1×1 convolutions (paper specification).
+    Combiner network: 3 final 1×1 convolutions with batch normalization.
     Combines decoder features with broadcast global latent to produce logits.
     """
     def __init__(self, dec_ch: int, z_dim: int):
         super().__init__()
-        # Project latent to feature space
-        self.proj_z = nn.Linear(z_dim, dec_ch)
+        # Project latent to feature space with BN
+        self.proj_z = nn.Sequential(
+            nn.Linear(z_dim, dec_ch),
+            nn.BatchNorm1d(dec_ch),
+            nn.ReLU(inplace=True)
+        )
         
-        # 3 final 1×1 convolutions (paper spec)
+        # 3 final 1×1 convolutions with BN (paper spec)
         self.combiner = nn.Sequential(
-            nn.Conv2d(dec_ch + dec_ch, dec_ch, kernel_size=1), nn.ReLU(inplace=True),
-            nn.Conv2d(dec_ch, dec_ch, kernel_size=1), nn.ReLU(inplace=True),  
-            nn.Conv2d(dec_ch, 1, kernel_size=1)  # Final logits
+            nn.Conv2d(dec_ch + dec_ch, dec_ch, kernel_size=1, bias=False), 
+            nn.BatchNorm2d(dec_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(dec_ch, dec_ch, kernel_size=1, bias=False), 
+            nn.BatchNorm2d(dec_ch), nn.ReLU(inplace=True),  
+            nn.Conv2d(dec_ch, 1, kernel_size=1)  # Final logits (keep bias)
         )
 
     def forward(self, dec_feat: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -222,7 +230,7 @@ class CombinerNetwork(nn.Module):
         B, dec_ch, H, W = dec_feat.shape
         
         # Project and broadcast latent
-        z_proj = self.proj_z(z)  # [B, dec_ch]
+        z_proj = self.proj_z(z)  # [B, dec_ch] (includes BN + ReLU)
         z_broadcast = z_proj.view(B, dec_ch, 1, 1).expand(B, dec_ch, H, W)  # [B, dec_ch, H, W]
         
         # Concatenate and combine
@@ -233,15 +241,15 @@ class CombinerNetwork(nn.Module):
 
 
 # ============================================================================
-# MAIN sPUNet MODEL
+# MAIN sPUNet MODEL WITH BATCH NORMALIZATION
 # ============================================================================
 
 class sPUNet(nn.Module):
     """
-    Standard Probabilistic U-Net (sPU-Net) for LIDC dataset.
+    Standard Probabilistic U-Net (sPU-Net) for LIDC dataset with BatchNorm.
     
     Architecture:
-    - 5-scale standard U-Net (3×3 conv blocks, not ResNet)
+    - 5-scale standard U-Net (3×3 conv blocks with BN, not ResNet)
     - Separate prior network (mirrors encoder)  
     - Separate posterior network (mirrors encoder)
     - 6 global latent variables
@@ -256,7 +264,7 @@ class sPUNet(nn.Module):
         super().__init__()
         self.z_dim = z_dim
         
-        # Main encoder-decoder (standard U-Net)
+        # Main encoder-decoder (standard U-Net with BN)
         self.encoder = StandardUNetEncoder(in_ch=in_ch, base=base)
         self.decoder = StandardUNetDecoder(self.encoder.channels)
         
@@ -264,7 +272,7 @@ class sPUNet(nn.Module):
         self.prior_net = PriorNetwork(in_ch=in_ch, base=base, z_dim=z_dim)
         self.posterior_net = PosteriorNetwork(in_ch=in_ch, base=base, z_dim=z_dim)
         
-        # Combiner network (3 final 1×1 convolutions)
+        # Combiner network (3 final 1×1 convolutions with BN)
         self.combiner = CombinerNetwork(self.decoder.out_ch, z_dim)
         
         # Paper-specified weight initialization
@@ -284,6 +292,10 @@ class sPUNet(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.normal_(m.bias, mean=0.0, std=0.001)
+            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                # Standard BN initialization
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor, y_target: Optional[torch.Tensor] = None, 
                 sample_posterior: bool = True) -> Tuple[torch.Tensor, Dict[str, Any]]:

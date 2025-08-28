@@ -50,7 +50,10 @@ cp "$PROJECT_DIR/configs/train_spu_lidc.json" "$RUN_DIR/"
 
 # ---- Train ----
 echo "[INFO] Starting SPU training at $(date)"
-srun python -u "$PROJECT_DIR/src/hpunet/train/train_spu.py" \
+PYTHON="$(command -v python)"         # resolve absolute path to your env's python
+which python
+python -V
+srun --export=ALL "$PYTHON" -u "$PROJECT_DIR/src/hpunet/train/train_spu.py" \
   --config "$RUN_DIR/train_spu_lidc.json" \
   --project-root "$STAGE_DIR" \
   --data-root "$STAGE_DIR/data" \

@@ -210,3 +210,7 @@ __marimo__/
 /data/
 !src/data/
 /runs/
+
+
+*.out
+*.err
