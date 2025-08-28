@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-# sPUNet Evaluation Script (Updated to match HPU script v3)
-# - Shows raw CT (no masking on input image).
-# - Computes IoU (empty-vs-empty => 1) and IoU-based GED^2 for reconstructions vs graders.
-# - Reports metrics for (A) all cases in the CSV scope and (B) only cases with all 4 graders.
-# - Two visualization styles; grader and reconstruction columns are aligned.
-# - All titles and footers right-aligned; IoU printed under each reconstruction.
-# - Switches: --csv-name (train.csv/test.csv), --eval-scope (all/visualize_only), --ged-clamp-nonneg.
-# - Saves metrics CSVs.
+# HPU-Net Evaluation Script (Updated v2)
+# - CT shown raw (no masking).
+# - IoU-based GED² for reconstructions vs graders.
+# - Metrics scope configurable: all rows in CSV (default) or only the visualized subset.
+# - IoU shown *under each reconstruction* (recon_i vs grader_i).
+# - All subplot titles/text right-aligned; larger fonts.
+# - Saves per-case metrics (all cases + only-4-graders).
 
 from __future__ import annotations
 
@@ -21,35 +20,31 @@ from torch.utils.data import DataLoader
 import csv
 
 from hpunet.data.dataset import LIDCCropsDataset
-from hpunet.models.spu_net import sPUNet
+from hpunet.models.hpu_net import HPUNet
 from hpunet.utils.config import load_config
 
 
 # ----------------------------
 # Model loading
 # ----------------------------
-
-def load_model(ckpt_path: Path, device: torch.device) -> sPUNet:
+def load_model(ckpt_path: Path, device: torch.device) -> HPUNet:
     ckpt = torch.load(ckpt_path, map_location=device)
-    # NOTE: adjust defaults if your sPUNet signature differs
-    model = sPUNet(in_ch=1, base=32, z_dim=6).to(device)
-    model.load_state_dict(ckpt["model"])  # expects key 'model'
+    model = HPUNet(in_ch=1, base=24, z_ch=1, n_blocks=3).to(device)
+    model.load_state_dict(ckpt["model"])
     model.eval()
-    print(f"Loaded sPUNet from step {ckpt.get('step', 'unknown')}")
+    print(f"Loaded model from step {ckpt.get('step', 'unknown')}")
     return model
 
 
 # ----------------------------
 # Sampling helpers
 # ----------------------------
-
 @torch.no_grad()
 def generate_posterior_reconstructions(
-    model: sPUNet,
+    model: HPUNet,
     image: torch.Tensor,
     grader_masks: torch.Tensor,
 ) -> List[torch.Tensor]:
-    """Generate one posterior reconstruction per grader annotation."""
     reconstructions = []
     for grader_idx in range(grader_masks.shape[1]):
         grader_mask = grader_masks[:, grader_idx : grader_idx + 1, :, :].float()
@@ -60,9 +55,8 @@ def generate_posterior_reconstructions(
 
 @torch.no_grad()
 def generate_prior_samples(
-    model: sPUNet, image: torch.Tensor, num_samples: int = 24
+    model: HPUNet, image: torch.Tensor, num_samples: int = 24
 ) -> List[torch.Tensor]:
-    """Generate unconditional prior samples."""
     samples = []
     for _ in range(num_samples):
         logits, _ = model(x=image, y_target=None, sample_posterior=False)
@@ -73,28 +67,29 @@ def generate_prior_samples(
 # ----------------------------
 # Array conversion helpers
 # ----------------------------
-
 def tensor_to_numpy_mask(tensor: torch.Tensor, threshold: float = 0.5) -> np.ndarray:
-    """Convert logits/prob/prob-like mask to binarized numpy (0/1)."""
     t = tensor.detach()
     if t.dim() == 4:
         t = t.squeeze(0).squeeze(0)
     elif t.dim() == 3:
         t = t.squeeze(0)
+
     arr = t.cpu().numpy().astype(np.float32)
+
     # If it looks like logits, apply sigmoid
     if arr.max() > 1.0 or arr.min() < 0.0:
         arr = 1.0 / (1.0 + np.exp(-arr))
+
     return (arr > threshold).astype(np.uint8)
 
 
 def tensor_to_numpy_ct_image(tensor: torch.Tensor) -> np.ndarray:
-    """Convert CT tensor to numpy WITHOUT masking; rescale to [0,1] for display."""
     t = tensor.detach()
     if t.dim() == 4:
         t = t.squeeze(0).squeeze(0)
     elif t.dim() == 3:
         t = t.squeeze(0)
+
     arr = t.cpu().numpy().astype(np.float32)
     vmin, vmax = float(arr.min()), float(arr.max())
     if vmax > vmin:
@@ -107,12 +102,11 @@ def tensor_to_numpy_ct_image(tensor: torch.Tensor) -> np.ndarray:
 # ----------------------------
 # IoU / GED^2 metrics
 # ----------------------------
-
 def iou_binary(a: np.ndarray, b: np.ndarray) -> float:
     inter = np.logical_and(a > 0, b > 0).sum(dtype=np.float64)
     union = np.logical_or(a > 0, b > 0).sum(dtype=np.float64)
     if union == 0.0:
-        return 1.0  # both empty -> perfect agreement
+        return 1.0
     return float(inter / union)
 
 
@@ -124,37 +118,40 @@ def pairwise_iou(set_A: List[np.ndarray], set_B: List[np.ndarray]) -> np.ndarray
     return mat
 
 
-def ged2_iou(set_S: List[np.ndarray], set_Y: List[np.ndarray], clamp_nonneg: bool = True) -> Dict[str, float]:
-    """GED^2 with IoU distance: d = 1 - IoU; expectations include diagonals (with-replacement).
-    GED^2 = 2*E[d(S,Y)] - E[d(S,S')] - E[d(Y,Y')]
-    """
+def ged2_iou(set_S: List[np.ndarray], set_Y: List[np.ndarray]) -> Dict[str, float]:
     if len(set_S) == 0 or len(set_Y) == 0:
         return {"GED2": float("nan"), "E_IoU_SY": float("nan"), "E_IoU_YY": float("nan"), "E_IoU_SS": float("nan")}
 
     iou_SY = pairwise_iou(set_S, set_Y)
     E_IoU_SY = float(iou_SY.mean())
 
-    iou_SS = pairwise_iou(set_S, set_S)
-    E_IoU_SS = float(iou_SS.mean())
+    if len(set_S) > 1:
+        iou_SS = pairwise_iou(set_S, set_S)
+        SS_no_diag = iou_SS.copy()
+        np.fill_diagonal(SS_no_diag, np.nan)
+        E_IoU_SS = float(np.nanmean(SS_no_diag))
+    else:
+        E_IoU_SS = 1.0
 
-    iou_YY = pairwise_iou(set_Y, set_Y)
-    E_IoU_YY = float(iou_YY.mean())
+    if len(set_Y) > 1:
+        iou_YY = pairwise_iou(set_Y, set_Y)
+        YY_no_diag = iou_YY.copy()
+        np.fill_diagonal(YY_no_diag, np.nan)
+        E_IoU_YY = float(np.nanmean(YY_no_diag))
+    else:
+        E_IoU_YY = 1.0
 
     E_d_SY = 1.0 - E_IoU_SY
     E_d_SS = 1.0 - E_IoU_SS
     E_d_YY = 1.0 - E_IoU_YY
 
     GED2 = 2.0 * E_d_SY - E_d_SS - E_d_YY
-    if clamp_nonneg and np.isfinite(GED2) and GED2 < 0.0:
-        GED2 = 0.0
-
     return {"GED2": float(GED2), "E_IoU_SY": E_IoU_SY, "E_IoU_YY": E_IoU_YY, "E_IoU_SS": E_IoU_SS}
 
 
 # ----------------------------
-# Visualization (right-aligned + aligned columns)
+# Visualization (right-aligned)
 # ----------------------------
-
 def _add_subplot(fig, nrows, ncols, idx, img, title, cmap="gray", title_fontsize=14):
     ax = fig.add_subplot(nrows, ncols, idx)
     ax.imshow(img, cmap=cmap, vmin=0, vmax=1)
@@ -167,7 +164,7 @@ def create_visualization_grid_style1(
     ct_scan: np.ndarray,
     grader_masks: np.ndarray,  # [4,H,W]
     reconstructions: List[np.ndarray],
-    recon_iou_list: List[Optional[float]],
+    recon_iou_list: List[Optional[float]],  # IoU per recon vs corresponding grader
     samples: List[np.ndarray],
     save_path: Path,
     title_fontsize: int = 14,
@@ -175,23 +172,23 @@ def create_visualization_grid_style1(
 ):
     fig = plt.figure(figsize=(16, 12))
 
-    # Row 1: CT + graders (cols 1..5)
+    # Row 1
     _add_subplot(fig, 6, 8, 1, ct_scan, "CT", title_fontsize=title_fontsize)
     for i in range(min(4, grader_masks.shape[0])):
         _add_subplot(fig, 6, 8, i + 2, grader_masks[i], f"grader {i+1}", title_fontsize=title_fontsize)
 
-    # Row 2: Reconstructions aligned under graders (cols 2..5)
+    # Row 2: Reconstructions with IoU footer (right-aligned)
     for i in range(min(4, len(reconstructions))):
-        idx = 8 + (i + 2)  # -> 10..13
-        ax = fig.add_subplot(6, 8, idx)
+        ax = fig.add_subplot(6, 8, 9 + i)
         ax.imshow(reconstructions[i], cmap="gray", vmin=0, vmax=1)
         ax.set_title(f"recon {i+1}", fontsize=title_fontsize, loc="right")
         ax.axis("off")
         iou_val = recon_iou_list[i]
         txt = "IoU=NA" if iou_val is None or np.isnan(iou_val) else f"IoU={iou_val:.3f}"
+        # place under the image, right-aligned
         ax.text(1.0, -0.08, txt, transform=ax.transAxes, ha="right", va="top", fontsize=footer_fontsize)
 
-    # Rows 3-6: 24 samples
+    # Rows 3-6: Samples
     for i in range(min(24, len(samples))):
         row = 2 + (i // 8)
         col = (i % 8) + 1
@@ -206,7 +203,7 @@ def create_visualization_grid_style1(
 
 def create_visualization_grid_style2(
     ct_scan: np.ndarray,
-    grader_masks: np.ndarray,
+    grader_masks: np.ndarray,  # [4,H,W]
     reconstructions: List[np.ndarray],
     recon_iou_list: List[Optional[float]],
     samples: List[np.ndarray],
@@ -223,19 +220,20 @@ def create_visualization_grid_style2(
         ax.axis("off")
         return ax
 
-    # Row 1: CT at col1; graders at cols 2..5
+    # Row 1
     add_at(0, 0, 6, ct_scan, "CT")
     for i in range(min(4, grader_masks.shape[0])):
         add_at(0, i + 1, 6, grader_masks[i], f"grader {i+1}")
 
-    # Row 2: Reconstructions aligned under graders -> cols 2..5
+    # Row 2: Reconstructions (with IoU footer)
     for i in range(min(4, len(reconstructions))):
-        ax = add_at(1, i + 1, 6, reconstructions[i], f"{i+1}" if i > 0 else "i) Reconstructions\n1")
+        title = f"{i+1}" if i > 0 else "i) Reconstructions\n1"
+        ax = add_at(1, i, 6, reconstructions[i], title)
         iou_val = recon_iou_list[i]
         txt = "IoU=NA" if iou_val is None or np.isnan(iou_val) else f"IoU={iou_val:.3f}"
         ax.text(1.0, -0.08, txt, transform=ax.transAxes, ha="right", va="top", fontsize=footer_fontsize)
 
-    # Row 3: Samples (cols 1..6)
+    # Row 3: Samples
     for i in range(min(6, len(samples))):
         title = f"{i+1}" if i > 0 else "ii) Samples\n1"
         add_at(2, i, 6, samples[i], title)
@@ -249,21 +247,18 @@ def create_visualization_grid_style2(
 # ----------------------------
 # Main
 # ----------------------------
-
 def main():
-    parser = argparse.ArgumentParser(description="sPUNet Evaluation and Visualization (Updated)")
+    parser = argparse.ArgumentParser(description="HPU-Net Evaluation and Visualization (Updated v2)")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Model checkpoint path")
     parser.add_argument("--config", type=Path, required=True, help="Training config file")
     parser.add_argument("--data-root", type=Path, required=True, help="Data root directory")
-    parser.add_argument("--csv-name", type=str, default="test.csv", help="CSV split to use (e.g., train.csv/test.csv)")
-    parser.add_argument("--output-dir", type=Path, default=Path("spu_evaluation_results"), help="Output directory")
+    parser.add_argument("--csv-name", type=str, default="test.csv", help="Which CSV to use (e.g., train.csv/test.csv)")
+    parser.add_argument("--output-dir", type=Path, default=Path("evaluation_results"), help="Output directory")
     parser.add_argument("--num-examples", type=int, default=5, help="Number of examples to visualize")
     parser.add_argument("--num-samples", type=int, default=24, help="Number of prior samples per example")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda/cpu)")
     parser.add_argument("--eval-scope", type=str, choices=["all", "visualize_only"], default="all",
                         help="Compute metrics over ALL rows in CSV (default) or only the visualized subset.")
-    parser.add_argument("--ged-clamp-nonneg", action="store_true", default=True,
-                        help="Clamp GED^2 to be non-negative (helps when small-sample bias yields tiny negatives).")
 
     args = parser.parse_args()
 
@@ -288,39 +283,40 @@ def main():
     print(f"Loaded {len(ds)} rows from {csv_path.name}")
 
     # Metrics accumulators
-    rows_all: List[dict] = []
-    rows_4g: List[dict] = []
+    rows_all = []
+    rows_4g = []
 
+    # For visualization, we only save plots for first num-examples rows encountered
     num_plotted = 0
 
-    for row_idx, batch in enumerate(loader):
+    for example_idx, batch in enumerate(loader):
+        # If computing metrics only for visualized subset
         if args.eval_scope == "visualize_only" and num_plotted >= args.num_examples:
             break
 
         image = batch["image"].to(device)   # [1,1,H,W]
         masks = batch["masks"].to(device)   # [1,4,H,W]
 
+        # Posterior reconstructions & prior samples
         reconstructions = generate_posterior_reconstructions(model, image, masks)
         samples = generate_prior_samples(model, image, args.num_samples)
 
-        ct_scan = tensor_to_numpy_ct_image(image)
+        # Arrays
+        ct_scan = tensor_to_numpy_ct_image(image)  # RAW CT
         grader_masks_np = [tensor_to_numpy_mask(masks[:, i : i + 1, :, :]) for i in range(masks.shape[1])]
         reconstructions_np = [tensor_to_numpy_mask(recon) for recon in reconstructions]
         samples_np = [tensor_to_numpy_mask(sample) for sample in samples]
 
+        # Available graders
         grader_available = [int(m.sum() > 0) for m in grader_masks_np]
         num_graders_avail = sum(grader_available)
 
-        # GED^2 metrics
+        # GED² metrics (recons vs ALL available graders)
         Y_all = [m for m in grader_masks_np if m.sum() > 0]
         S_recon = reconstructions_np
-        if len(Y_all) > 0 and len(S_recon) > 0:
-            metrics_all = ged2_iou(S_recon, Y_all, clamp_nonneg=args.ged_clamp_nonneg)
-        else:
-            metrics_all = {"GED2": np.nan, "E_IoU_SY": np.nan, "E_IoU_YY": np.nan, "E_IoU_SS": np.nan}
-
+        metrics_all = ged2_iou(S_recon, Y_all)
         rows_all.append({
-            "row_idx": row_idx,
+            "row_idx": example_idx,
             "num_graders": num_graders_avail,
             "GED2_IoU": metrics_all["GED2"],
             "E_IoU_SY": metrics_all["E_IoU_SY"],
@@ -328,10 +324,11 @@ def main():
             "E_IoU_SS": metrics_all["E_IoU_SS"],
         })
 
-        if num_graders_avail == 4 and len(S_recon) > 0:
-            metrics_4g = ged2_iou(S_recon, grader_masks_np, clamp_nonneg=args.ged_clamp_nonneg)
+        # Only cases with all 4 graders
+        if num_graders_avail == 4:
+            metrics_4g = ged2_iou(S_recon, grader_masks_np)
             rows_4g.append({
-                "row_idx": row_idx,
+                "row_idx": example_idx,
                 "num_graders": num_graders_avail,
                 "GED2_IoU": metrics_4g["GED2"],
                 "E_IoU_SY": metrics_4g["E_IoU_SY"],
@@ -339,22 +336,23 @@ def main():
                 "E_IoU_SS": metrics_4g["E_IoU_SS"],
             })
 
-        # Visualizations (first N rows)
+        # Visualization for the first N examples only
         if num_plotted < args.num_examples:
-            H, W = reconstructions_np[0].shape
-            blank = np.zeros((H, W), dtype=np.uint8)
+            # IoU under each reconstruction: recon_i vs grader_i (if available; else NA)
             recon_iou_list = []
             for i in range(min(4, len(reconstructions_np))):
-                ref = grader_masks_np[i] if grader_available[i] else blank
-                recon_iou_list.append(iou_binary(reconstructions_np[i], ref))
+                if grader_available[i]:
+                    recon_iou_list.append(iou_binary(reconstructions_np[i], grader_masks_np[i]))
+                else:
+                    recon_iou_list.append(np.nan)
 
-            save_path_1 = args.output_dir / f"row_{row_idx:05d}_style1.png"
+            save_path_1 = args.output_dir / f"row_{example_idx:05d}_style1.png"
             create_visualization_grid_style1(
                 ct_scan, np.array(grader_masks_np), reconstructions_np, recon_iou_list, samples_np,
                 save_path_1, title_fontsize=14, footer_fontsize=12
             )
 
-            save_path_2 = args.output_dir / f"row_{row_idx:05d}_style2.png"
+            save_path_2 = args.output_dir / f"row_{example_idx:05d}_style2.png"
             create_visualization_grid_style2(
                 ct_scan, np.array(grader_masks_np), reconstructions_np, recon_iou_list, samples_np[:6],
                 save_path_2, title_fontsize=14, footer_fontsize=12
@@ -362,10 +360,11 @@ def main():
 
             num_plotted += 1
 
+        # If metrics should span all rows, continue; otherwise we may break after plotted
         if args.eval_scope == "visualize_only" and num_plotted >= args.num_examples:
             break
 
-    # Save CSVs
+    # Save metrics
     def write_csv(path: Path, rows: List[dict]):
         if not rows:
             print(f"No rows to write for {path.name}")
@@ -394,7 +393,7 @@ def main():
     summarize(rows_all, "ALL CASES (per CSV scope)")
     summarize(rows_4g, "ONLY 4 GRADERS")
 
-    print(f"\nDone. sPUNet results saved to: {args.output_dir}")
+    print(f"\nDone. Plots & CSVs saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":
