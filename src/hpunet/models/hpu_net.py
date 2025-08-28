@@ -1,13 +1,29 @@
-# hpu_net.py - COMPLETE 8-SCALE IMPLEMENTATION
+# hpu_net.py - COMPLETE 8-SCALE IMPLEMENTATION WITH NUMERICAL STABILITY FIXES
 import torch
 from torch import nn
 import torch.nn.functional as F
 from .unet_blocks import ResStack, ResDown, ResUp
 
 def gaussian_kl_spatial(mu_q, lv_q, mu_p, lv_p) -> torch.Tensor:
-    """KL(q||p) for diagonal Gaussians over (C,H,W), return [B]"""
-    var_q, var_p = torch.exp(lv_q), torch.exp(lv_p)
-    kl = 0.5 * (lv_p - lv_q + (var_q + (mu_q - mu_p) ** 2) / (var_p + 1e-8) - 1.0)
+    """
+    KL(q||p) for diagonal Gaussians over (C,H,W), return [B]
+    Numerically stable implementation to prevent CUDA overflow errors.
+    """
+    # Clamp log-variances to prevent overflow
+    lv_q = torch.clamp(lv_q, -10.0, 10.0)
+    lv_p = torch.clamp(lv_p, -10.0, 10.0)
+    
+    # Compute KL in log-space for numerical stability
+    kl = 0.5 * (
+        lv_p - lv_q 
+        + torch.exp(lv_q - lv_p) 
+        + (mu_q - mu_p).pow(2) * torch.exp(-lv_p)
+        - 1.0
+    )
+    
+    # Check for NaN/Inf and replace with zeros
+    kl = torch.where(torch.isfinite(kl), kl, torch.zeros_like(kl))
+    
     return kl.flatten(1).sum(1)  # [B]
 
 class GaussianParam2d(nn.Module):
@@ -354,14 +370,25 @@ class HPUNet(nn.Module):
         logits = self.head(d1_final)
 
         # =================================================================
-        # AGGREGATE KL LOSS AND STORE INFO
+        # AGGREGATE KL LOSS AND STORE INFO (WITH NUMERICAL SAFETY)
         # =================================================================
         
         if KLs:
-            info["KL_sum"] = torch.stack(KLs, dim=0).sum(0).mean()  # Sum all 8 KL terms
-            info["KL_per_scale"] = [kl.mean().item() for kl in KLs]  # For debugging
+            # Stack and check for numerical issues
+            kl_stack = torch.stack(KLs, dim=0)
+            kl_stack = torch.where(torch.isfinite(kl_stack), kl_stack, torch.zeros_like(kl_stack))
+            
+            info["KL_sum"] = kl_stack.sum(0).mean()  # Sum all 8 KL terms
+            # Safe computation of per-scale KL for debugging
+            info["KL_per_scale"] = []
+            for i, kl in enumerate(KLs):
+                if torch.isfinite(kl).all():
+                    info["KL_per_scale"].append(float(kl.mean().item()))
+                else:
+                    info["KL_per_scale"].append(0.0)
         else:
             info["KL_sum"] = torch.tensor(0.0, device=x.device)
+            info["KL_per_scale"] = []
 
         # Store all distribution parameters for debugging/analysis
         info.update({
