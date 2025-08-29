@@ -2,7 +2,7 @@
 #SBATCH --job-name=spu-a100
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:a100:1
-#SBATCH --time=08:00:00
+#SBATCH --time=10:00:00
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 #SBATCH --export=NONE

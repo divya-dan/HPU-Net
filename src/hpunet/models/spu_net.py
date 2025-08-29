@@ -1,358 +1,215 @@
-# spu_net.py - CORRECTED IMPLEMENTATION WITH BATCH NORMALIZATION
+"""
+Paper-faithful sPU-Net (Probabilistic U-Net) for LIDC
+-----------------------------------------------------------------
+- 5-scale standard U-Net (no BatchNorm), 3×(3×3 conv + ReLU) per scale
+- Bilinear downsampling/upsampling between scales
+- Separate prior and posterior networks that mirror the encoder
+- Single global latent vector z ∈ R^6
+- Latent is broadcast and concatenated with decoder features
+- Combiner: three 1×1 conv layers → logits (no sigmoid)
+- Weight init: orthogonal weights, truncated-normal biases (σ=1e-3)
+- Forward returns (logits, info) with per-sample KL (sum over z-dims)
+"""
 from __future__ import annotations
 from typing import Tuple, Dict, Any, Optional
+
 import torch
 from torch import nn
 import torch.nn.functional as F
 
 
-def gaussian_kl(mu_q, logvar_q, mu_p, logvar_p) -> torch.Tensor:
-    """
-    KL( N(mu_q, sigma_q^2) || N(mu_p, sigma_p^2) ) per sample.
-    Returns [B] (sum over latent dims).
-    """
-    # all shape: [B, Z]
+# -----------------------------------------------------------------------------
+# Utils
+# -----------------------------------------------------------------------------
+
+def _truncated_normal_(tensor: torch.Tensor, std: float = 1e-3, a: float = -2.0, b: float = 2.0) -> None:
+    with torch.no_grad():
+        tensor.normal_(mean=0.0, std=std)
+        tensor.clamp_(a * std, b * std)
+
+
+def gaussian_kl(mu_q: torch.Tensor, logvar_q: torch.Tensor,
+                mu_p: torch.Tensor, logvar_p: torch.Tensor) -> torch.Tensor:
     var_q = torch.exp(logvar_q)
     var_p = torch.exp(logvar_p)
-    kl = 0.5 * (
-        (logvar_p - logvar_q)
-        + (var_q + (mu_q - mu_p) ** 2) / (var_p + 1e-8)
-        - 1.0
-    )
+    kl = 0.5 * ((logvar_p - logvar_q) + (var_q + (mu_q - mu_p) ** 2) / (var_p + 1e-8) - 1.0)
     return kl.sum(dim=1)
 
 
-# ============================================================================
-# STANDARD U-NET COMPONENTS WITH BATCH NORMALIZATION
-# ============================================================================
+# -----------------------------------------------------------------------------
+# Paper-faithful Conv Blocks (3×3 conv + ReLU, bias=True)
+# -----------------------------------------------------------------------------
 
-def standard_conv_block(in_ch: int, out_ch: int, k: int = 3, p: int = 1) -> nn.Sequential:
-    """Standard conv block with BatchNorm: 3 × (3x3 Conv + BN + ReLU)"""
-    return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=p, bias=False),  # No bias with BN
-        nn.BatchNorm2d(out_ch),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(out_ch, out_ch, kernel_size=k, padding=p, bias=False),
-        nn.BatchNorm2d(out_ch),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(out_ch, out_ch, kernel_size=k, padding=p, bias=True),   # Keep bias on final layer
-        nn.ReLU(inplace=True),
-    )
-
-
-class StandardDown(nn.Module):
-    """Downsampling block: avg pool + standard conv block"""
+class ConvBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        self.pool = nn.AvgPool2d(2)  # Average pooling (paper spec)
-        self.block = standard_conv_block(in_ch, out_ch)
-    
-    def forward(self, x):
-        return self.block(self.pool(x))
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=True)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=True)
+        self.conv3 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=True)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act(self.conv1(x))
+        x = self.act(self.conv2(x))
+        x = self.act(self.conv3(x))
+        return x
 
 
-class StandardUp(nn.Module):
-    """Upsampling block: nearest neighbor + concat + standard conv block"""
-    def __init__(self, in_ch_up: int, skip_ch: int, out_ch: int):
+class Encoder(nn.Module):
+    def __init__(self, in_ch: int, base: int = 32):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode="nearest")  # Nearest neighbor (paper spec)
-        self.conv = standard_conv_block(in_ch_up + skip_ch, out_ch)
-    
-    def forward(self, x, skip):
-        x = self.up(x)
-        # Handle size mismatches
-        dh = skip.size(2) - x.size(2)
-        dw = skip.size(3) - x.size(3)
-        if dh or dw:
-            x = F.pad(x, [dw//2, dw-dw//2, dh//2, dh-dh//2])
-        return self.conv(torch.cat([x, skip], dim=1))
+        self.enc1 = ConvBlock(in_ch, base)
+        self.enc2 = ConvBlock(base, base*2)
+        self.enc3 = ConvBlock(base*2, base*4)
+        self.enc4 = ConvBlock(base*4, base*8)
+        self.enc5 = ConvBlock(base*8, base*16)
+        # (downsampling via bilinear interpolation in forward)
+        self.channels = [base, base*2, base*4, base*8, base*16]
 
-
-def _cap_channels(c: int) -> int:
-    """Cap channels at 192 (paper specification)"""
-    return min(c, 192)
-
-
-class StandardUNetEncoder(nn.Module):
-    """
-    Standard U-Net encoder for sPUNet: 5 scales with 3×3 conv blocks.
-    Base=32, doubled after each downsampling, capped at 192.
-    """
-    def __init__(self, in_ch: int = 1, base: int = 32):
-        super().__init__()
-        C1 = _cap_channels(base)      # 32
-        C2 = _cap_channels(base*2)    # 64  
-        C3 = _cap_channels(base*4)    # 128
-        C4 = _cap_channels(base*8)    # 192 (capped)
-        C5 = _cap_channels(base*16)   # 192 (capped)
-        
-        self.enc1 = standard_conv_block(in_ch, C1)
-        self.down1 = StandardDown(C1, C2)
-        self.down2 = StandardDown(C2, C3)
-        self.down3 = StandardDown(C3, C4)
-        self.down4 = StandardDown(C4, C5)
-        
-        self.channels = (C1, C2, C3, C4, C5)
-
-    def forward(self, x):
-        e1 = self.enc1(x)      # 128x128
-        e2 = self.down1(e1)    # 64x64
-        e3 = self.down2(e2)    # 32x32
-        e4 = self.down3(e3)    # 16x16
-        e5 = self.down4(e4)    # 8x8
+    def forward(self, x: torch.Tensor):
+        e1 = self.enc1(x)
+        e2 = self.enc2(F.interpolate(e1, scale_factor=0.5, mode="bilinear", align_corners=False))
+        e3 = self.enc3(F.interpolate(e2, scale_factor=0.5, mode="bilinear", align_corners=False))
+        e4 = self.enc4(F.interpolate(e3, scale_factor=0.5, mode="bilinear", align_corners=False))
+        e5 = self.enc5(F.interpolate(e4, scale_factor=0.5, mode="bilinear", align_corners=False))
         return e1, e2, e3, e4, e5
 
 
-class StandardUNetDecoder(nn.Module):
-    """Standard U-Net decoder for sPUNet"""
-    def __init__(self, chans: tuple[int,int,int,int,int]):
+class Decoder(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        C1, C2, C3, C4, C5 = chans
-        
-        self.up4 = StandardUp(in_ch_up=C5, skip_ch=C4, out_ch=C4)  # 8->16
-        self.up3 = StandardUp(in_ch_up=C4, skip_ch=C3, out_ch=C3)  # 16->32
-        self.up2 = StandardUp(in_ch_up=C3, skip_ch=C2, out_ch=C2)  # 32->64
-        self.up1 = StandardUp(in_ch_up=C2, skip_ch=C1, out_ch=C1)  # 64->128
-        
+        C1, C2, C3, C4, C5 = channels
+        self.up4 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.dec4 = ConvBlock(C5 + C4, C4)
+        self.up3 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.dec3 = ConvBlock(C4 + C3, C3)
+        self.up2 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.dec2 = ConvBlock(C3 + C2, C2)
+        self.up1 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.dec1 = ConvBlock(C2 + C1, C1)
         self.out_ch = C1
 
     def forward(self, e1, e2, e3, e4, e5):
-        d4 = self.up4(e5, e4)  # 8x8 -> 16x16
-        d3 = self.up3(d4, e3)  # 16x16 -> 32x32  
-        d2 = self.up2(d3, e2)  # 32x32 -> 64x64
-        d1 = self.up1(d2, e1)  # 64x64 -> 128x128
+        d4 = self.dec4(torch.cat([self.up4(e5), e4], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
         return d1
 
 
-# ============================================================================
-# sPUNet COMPONENTS WITH BATCH NORMALIZATION
-# ============================================================================
+# -----------------------------------------------------------------------------
+# Prior & Posterior Networks
+# -----------------------------------------------------------------------------
 
-class PriorNetwork(nn.Module):
-    """
-    SEPARATE prior network that mirrors the U-Net encoder (paper specification).
-    Takes image input, produces global latent distribution parameters.
-    """
+class PriorNet(nn.Module):
     def __init__(self, in_ch: int, base: int, z_dim: int):
         super().__init__()
-        # Mirror the main encoder architecture
-        self.encoder = StandardUNetEncoder(in_ch=in_ch, base=base)
+        self.encoder = Encoder(in_ch=in_ch, base=base)
         C1, C2, C3, C4, C5 = self.encoder.channels
-        
-        # Global average pooling + linear layers for latent parameters
         self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.mu_head = nn.Sequential(
-            nn.Linear(C5, C5), nn.BatchNorm1d(C5), nn.ReLU(inplace=True),
-            nn.Linear(C5, z_dim)
-        )
-        self.logvar_head = nn.Sequential(
-            nn.Linear(C5, C5), nn.BatchNorm1d(C5), nn.ReLU(inplace=True),
-            nn.Linear(C5, z_dim)
-        )
+        self.mu_head = nn.Conv2d(C5, z_dim, kernel_size=1, bias=True)
+        self.logvar_head = nn.Conv2d(C5, z_dim, kernel_size=1, bias=True)
 
-    def forward(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Encode through mirrored encoder
-        _, _, _, _, e5 = self.encoder(x)  # Only need deepest features
-        
-        # Global pooling and latent prediction
-        h = self.global_pool(e5).flatten(1)  # [B, C5]
-        mu = self.mu_head(h)                 # [B, z_dim]
-        logvar = self.logvar_head(h).clamp(-10.0, 10.0)  # [B, z_dim]
-        
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        *_, e5 = self.encoder(x)
+        h = self.global_pool(e5)
+        mu = self.mu_head(h).squeeze(-1).squeeze(-1)
+        logvar = self.logvar_head(h).squeeze(-1).squeeze(-1).clamp(-10.0, 10.0)
         return mu, logvar
 
 
-class PosteriorNetwork(nn.Module):
-    """
-    SEPARATE posterior network that mirrors the U-Net encoder.
-    Takes concatenated image+mask input, produces global latent distribution parameters.
-    """
+class PosteriorNet(nn.Module):
     def __init__(self, in_ch: int, base: int, z_dim: int):
         super().__init__()
-        # Input is image+mask concatenated: in_ch + 1
-        self.encoder = StandardUNetEncoder(in_ch=in_ch + 1, base=base)
+        self.encoder = Encoder(in_ch=in_ch + 1, base=base)
         C1, C2, C3, C4, C5 = self.encoder.channels
-        
-        # Global average pooling + linear layers
         self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.mu_head = nn.Sequential(
-            nn.Linear(C5, C5), nn.BatchNorm1d(C5), nn.ReLU(inplace=True),
-            nn.Linear(C5, z_dim)
-        )
-        self.logvar_head = nn.Sequential(
-            nn.Linear(C5, C5), nn.BatchNorm1d(C5), nn.ReLU(inplace=True),
-            nn.Linear(C5, z_dim)
-        )
+        self.mu_head = nn.Conv2d(C5, z_dim, kernel_size=1, bias=True)
+        self.logvar_head = nn.Conv2d(C5, z_dim, kernel_size=1, bias=True)
 
-    def forward(self, xy) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Encode through mirrored encoder
-        _, _, _, _, e5 = self.encoder(xy)  # Only need deepest features
-        
-        # Global pooling and latent prediction
-        h = self.global_pool(e5).flatten(1)  # [B, C5]
-        mu = self.mu_head(h)                 # [B, z_dim]
-        logvar = self.logvar_head(h).clamp(-10.0, 10.0)  # [B, z_dim]
-        
+    def forward(self, x_and_y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        *_, e5 = self.encoder(x_and_y)
+        h = self.global_pool(e5)
+        mu = self.mu_head(h).squeeze(-1).squeeze(-1)
+        logvar = self.logvar_head(h).squeeze(-1).squeeze(-1).clamp(-10.0, 10.0)
         return mu, logvar
 
 
-class CombinerNetwork(nn.Module):
-    """
-    Combiner network: 3 final 1×1 convolutions with batch normalization.
-    Combines decoder features with broadcast global latent to produce logits.
-    """
+# -----------------------------------------------------------------------------
+# Combiner
+# -----------------------------------------------------------------------------
+
+class Combiner(nn.Module):
     def __init__(self, dec_ch: int, z_dim: int):
         super().__init__()
-        # Project latent to feature space with BN
-        self.proj_z = nn.Sequential(
-            nn.Linear(z_dim, dec_ch),
-            nn.BatchNorm1d(dec_ch),
-            nn.ReLU(inplace=True)
-        )
-        
-        # 3 final 1×1 convolutions with BN (paper spec)
-        self.combiner = nn.Sequential(
-            nn.Conv2d(dec_ch + dec_ch, dec_ch, kernel_size=1, bias=False), 
-            nn.BatchNorm2d(dec_ch), nn.ReLU(inplace=True),
-            nn.Conv2d(dec_ch, dec_ch, kernel_size=1, bias=False), 
-            nn.BatchNorm2d(dec_ch), nn.ReLU(inplace=True),  
-            nn.Conv2d(dec_ch, 1, kernel_size=1)  # Final logits (keep bias)
+        self.combine = nn.Sequential(
+            nn.Conv2d(dec_ch + z_dim, dec_ch, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dec_ch, dec_ch, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dec_ch, 1, kernel_size=1, bias=True),
         )
 
     def forward(self, dec_feat: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            dec_feat: Decoder features [B, dec_ch, H, W]  
-            z: Global latent [B, z_dim]
-        Returns:
-            logits: [B, 1, H, W]
-        """
-        B, dec_ch, H, W = dec_feat.shape
-        
-        # Project and broadcast latent
-        z_proj = self.proj_z(z)  # [B, dec_ch] (includes BN + ReLU)
-        z_broadcast = z_proj.view(B, dec_ch, 1, 1).expand(B, dec_ch, H, W)  # [B, dec_ch, H, W]
-        
-        # Concatenate and combine
-        combined = torch.cat([dec_feat, z_broadcast], dim=1)  # [B, 2*dec_ch, H, W]
-        logits = self.combiner(combined)  # [B, 1, H, W]
-        
-        return logits
+        B, C, H, W = dec_feat.shape
+        z_b = z.view(B, -1, 1, 1).expand(B, z.size(1), H, W)
+        x = torch.cat([dec_feat, z_b], dim=1)
+        return self.combine(x)
 
 
-# ============================================================================
-# MAIN sPUNet MODEL WITH BATCH NORMALIZATION
-# ============================================================================
+# -----------------------------------------------------------------------------
+# sPU-Net main module
+# -----------------------------------------------------------------------------
 
 class sPUNet(nn.Module):
-    """
-    Standard Probabilistic U-Net (sPU-Net) for LIDC dataset with BatchNorm.
-    
-    Architecture:
-    - 5-scale standard U-Net (3×3 conv blocks with BN, not ResNet)
-    - Separate prior network (mirrors encoder)  
-    - Separate posterior network (mirrors encoder)
-    - 6 global latent variables
-    - 3 final 1×1 convolutions in combiner
-    
-    Training:
-    - Standard ELBO loss (β = 1)
-    - Base channels = 32
-    - Learning rate: 0.5×10⁻⁵ → 1×10⁻⁶ in 5 steps
-    """
     def __init__(self, in_ch: int = 1, base: int = 32, z_dim: int = 6):
         super().__init__()
         self.z_dim = z_dim
-        
-        # Main encoder-decoder (standard U-Net with BN)
-        self.encoder = StandardUNetEncoder(in_ch=in_ch, base=base)
-        self.decoder = StandardUNetDecoder(self.encoder.channels)
-        
-        # Separate prior and posterior networks (paper specification)
-        self.prior_net = PriorNetwork(in_ch=in_ch, base=base, z_dim=z_dim)
-        self.posterior_net = PosteriorNetwork(in_ch=in_ch, base=base, z_dim=z_dim)
-        
-        # Combiner network (3 final 1×1 convolutions with BN)
-        self.combiner = CombinerNetwork(self.decoder.out_ch, z_dim)
-        
-        # Paper-specified weight initialization
+        self.encoder = Encoder(in_ch=in_ch, base=base)
+        self.decoder = Decoder(self.encoder.channels)
+        self.prior = PriorNet(in_ch=in_ch, base=base, z_dim=z_dim)
+        self.post = PosteriorNet(in_ch=in_ch, base=base, z_dim=z_dim)
+        self.combiner = Combiner(dec_ch=self.decoder.out_ch, z_dim=z_dim)
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights as per paper specification"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                # Orthogonal initialization with gain=1.0
                 nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
-                    # Truncated normal with stddev=0.001
-                    nn.init.normal_(m.bias, mean=0.0, std=0.001)
+                    _truncated_normal_(m.bias, std=1e-3)
             elif isinstance(m, nn.Linear):
-                # Orthogonal for linear layers too
                 nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
-                    nn.init.normal_(m.bias, mean=0.0, std=0.001)
-            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                # Standard BN initialization
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+                    _truncated_normal_(m.bias, std=1e-3)
 
-    def forward(self, x: torch.Tensor, y_target: Optional[torch.Tensor] = None, 
-                sample_posterior: bool = True) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """
-        Forward pass for sPU-Net.
-        
-        Args:
-            x: Input image [B,1,H,W]
-            y_target: Target segmentation [B,1,H,W] (for posterior sampling)  
-            sample_posterior: If True and y_target provided, sample from posterior
-            
-        Returns:
-            logits: Predicted logits [B,1,H,W]
-            info: Dict with distribution parameters and KL divergence
-        """
-        # Encode image through main encoder
+    def forward(self, x: torch.Tensor, y_target: Optional[torch.Tensor] = None, sample_posterior: bool = True) -> Tuple[torch.Tensor, Dict[str, Any]]:
         e1, e2, e3, e4, e5 = self.encoder(x)
-        
-        # Decode to get feature representation
-        dec_feat = self.decoder(e1, e2, e3, e4, e5)  # [B, dec_ch, 128, 128]
-        
-        # Prior distribution p(z|x) from separate prior network
-        mu_p, logvar_p = self.prior_net(x)  # [B, z_dim]
-        
+        dec_feat = self.decoder(e1, e2, e3, e4, e5)
+
+        mu_p, logvar_p = self.prior(x)
+
         mu_q = logvar_q = None
         if (y_target is not None) and sample_posterior:
-            # Posterior distribution q(z|x,y) from separate posterior network
-            xy = torch.cat([x, y_target], dim=1)  # [B, 2, H, W]
-            mu_q, logvar_q = self.posterior_net(xy)  # [B, z_dim]
-            
-            # Reparameterization trick: sample from posterior
+            xy = torch.cat([x, y_target], dim=1)
+            mu_q, logvar_q = self.post(xy)
             std_q = torch.exp(0.5 * logvar_q)
-            eps = torch.randn_like(std_q)
-            z = mu_q + eps * std_q
+            z = mu_q + torch.randn_like(std_q) * std_q
         else:
-            # Sample from prior p(z|x)
             std_p = torch.exp(0.5 * logvar_p)
-            eps = torch.randn_like(std_p)
-            z = mu_p + eps * std_p
+            z = mu_p + torch.randn_like(std_p) * std_p
 
-        # Combine decoder features with latent to get logits
-        logits = self.combiner(dec_feat, z)  # [B, 1, H, W]
+        logits = self.combiner(dec_feat, z)
 
-        # Compute KL divergence if both posterior and prior are available
         if (mu_q is not None) and (logvar_q is not None):
-            kl = gaussian_kl(mu_q, logvar_q, mu_p, logvar_p)  # [B]
-            kl_sum = kl.mean()  # Scalar for loss
+            kl = gaussian_kl(mu_q, logvar_q, mu_p, logvar_p)
         else:
             kl = torch.zeros(x.size(0), device=x.device)
-            kl_sum = torch.tensor(0.0, device=x.device)
 
         info: Dict[str, Any] = {
             "mu_p": mu_p, "logvar_p": logvar_p,
             "mu_q": mu_q, "logvar_q": logvar_q,
             "z": z,
-            "kl": kl,           # [B] - per sample KL
-            # "KL_sum": kl_sum    # Scalar - mean KL for loss
+            "kl": kl,
         }
-
         return logits, info
