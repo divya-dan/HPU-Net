@@ -74,8 +74,7 @@ class LIDCCropsDataset(Dataset):
         self.df = pd.read_csv(self.csv_path)
         required_cols = [
             "split", "patient", "stem", "img_path",
-            "mask_l1", "mask_l2", "mask_l3", "mask_l4",
-            "has_l1", "has_l2", "has_l3", "has_l4",
+            "mask_l0", "mask_l1", "mask_l2", "mask_l3",
         ]
         missing = [c for c in required_cols if c not in self.df.columns]
         if missing:
@@ -89,7 +88,7 @@ class LIDCCropsDataset(Dataset):
         self.mask_paths: List[List[Optional[Path]]] = []
         for _, row in self.df.iterrows():
             paths = []
-            for k in ["mask_l1", "mask_l2", "mask_l3", "mask_l4"]:
+            for k in ["mask_l0", "mask_l1", "mask_l2", "mask_l3"]:
                 p = row[k]
                 paths.append(_to_abs(p) if isinstance(p, str) and len(p) > 0 else None)
             self.mask_paths.append(paths)

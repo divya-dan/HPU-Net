@@ -5,15 +5,15 @@ Build CSV manifests for LIDC crops.
 For each split (train/val/test), this script scans:
   data_root/<split>/
     images/<patient_id>/*.png
-    gt/<patient_id>/*_l[1..4].png
+    gt/<patient_id>/*_l[0..3].png
 
 It writes one CSV per split with columns:
   split,patient,stem,img_path,
-  mask_l1,mask_l2,mask_l3,mask_l4,
-  has_l1,has_l2,has_l3,has_l4,n_masks
+  mask_l0,mask_l1,mask_l2,mask_l3,
+  has_l0,has_l1,has_l2,has_l3,n_masks
 
 Paths are written relative to the project root (useful for portability).
-If a grader's mask is missing, the path is empty and has_l#=False (your Dataset
+If a grader's mask is missing or completely black, the path is empty and has_l#=False (your Dataset
 will substitute an all-zeros mask for such channels).
 """
 
@@ -21,6 +21,18 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import pandas as pd
+import cv2
+import numpy as np
+
+def is_mask_empty(mask_path: Path) -> bool:
+    """Check if mask image is completely black (all pixels are 0)."""
+    try:
+        img = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return True
+        return np.all(img == 0)
+    except Exception:
+        return True
 
 def collect_split(split_dir: Path, split_name: str, project_root: Path) -> pd.DataFrame:
     images_dir = split_dir / "images"
@@ -38,15 +50,18 @@ def collect_split(split_dir: Path, split_name: str, project_root: Path) -> pd.Da
         # iterate images deterministically
         for img_path in sorted(patient_dir.glob("*.png")):
             stem = img_path.stem  # e.g., "z-<ZPOS>_c<CROP>"
-            # Masks for graders 1..4
+            # Masks for graders 0..3
             mask_paths = []
             has_flags = []
-            for l in range(1, 5):
+            for l in range(0, 4):  # Changed from range(1, 5) to range(0, 4)
                 mpath = gt_dir / patient / f"{stem}_l{l}.png"
                 if mpath.exists():
+                    # File exists, include path regardless of content
                     mask_paths.append(mpath)
-                    has_flags.append(True)
+                    # But set has_flag based on whether mask is empty
+                    has_flags.append(not is_mask_empty(mpath))
                 else:
+                    # File doesn't exist
                     mask_paths.append(None)
                     has_flags.append(False)
 
@@ -60,14 +75,14 @@ def collect_split(split_dir: Path, split_name: str, project_root: Path) -> pd.Da
                 "patient": patient,
                 "stem": stem,
                 "img_path": rel_img.as_posix(),
-                "mask_l1": rel_masks[0],
-                "mask_l2": rel_masks[1],
-                "mask_l3": rel_masks[2],
-                "mask_l4": rel_masks[3],
-                "has_l1": has_flags[0],
-                "has_l2": has_flags[1],
-                "has_l3": has_flags[2],
-                "has_l4": has_flags[3],
+                "mask_l0": rel_masks[0],  # Changed from mask_l1 to mask_l0
+                "mask_l1": rel_masks[1],
+                "mask_l2": rel_masks[2],
+                "mask_l3": rel_masks[3],  # Changed from mask_l4 to mask_l3
+                "has_l0": has_flags[0],   # Changed from has_l1 to has_l0
+                "has_l1": has_flags[1],
+                "has_l2": has_flags[2],
+                "has_l3": has_flags[3],   # Changed from has_l4 to has_l3
                 "n_masks": int(sum(has_flags)),
             }
             rows.append(row)

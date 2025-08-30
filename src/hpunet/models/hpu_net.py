@@ -1,19 +1,20 @@
-# hpu_net.py - COMPLETE 8-SCALE IMPLEMENTATION WITH NUMERICAL STABILITY FIXES
+# hpu_net.py - 8-scale hierarchical PU-Net implementation
 import torch
 from torch import nn
 import torch.nn.functional as F
 from .unet_blocks import ResStack, ResDown, ResUp
 
+
 def gaussian_kl_spatial(mu_q, lv_q, mu_p, lv_p) -> torch.Tensor:
     """
-    KL(q||p) for diagonal Gaussians over (C,H,W), return [B]
-    Numerically stable implementation to prevent CUDA overflow errors.
+    KL(q||p) for diagonal gaussians over (C,H,W), return [B]
+    numerically stable to prevent CUDA overflow errors
     """
-    # Clamp log-variances to prevent overflow
+    # clamp log-variances to prevent overflow
     lv_q = torch.clamp(lv_q, -10.0, 10.0)
     lv_p = torch.clamp(lv_p, -10.0, 10.0)
     
-    # Compute KL in log-space for numerical stability
+    # compute KL in log-space for numerical stability
     kl = 0.5 * (
         lv_p - lv_q 
         + torch.exp(lv_q - lv_p) 
@@ -21,13 +22,14 @@ def gaussian_kl_spatial(mu_q, lv_q, mu_p, lv_p) -> torch.Tensor:
         - 1.0
     )
     
-    # Check for NaN/Inf and replace with zeros
+    # check for NaN/Inf and replace with zeros
     kl = torch.where(torch.isfinite(kl), kl, torch.zeros_like(kl))
     
     return kl.flatten(1).sum(1)  # [B]
 
+
 class GaussianParam2d(nn.Module):
-    """Predicts mean and log-variance for 2D Gaussian distributions"""
+    """predicts mean and log-variance for 2D gaussian distributions"""
     def __init__(self, in_ch: int, z_ch: int):
         super().__init__()
         self.z_ch = z_ch
@@ -42,8 +44,9 @@ class GaussianParam2d(nn.Module):
         lv = torch.clamp(lv, -10.0, 10.0)          # stabilize log-variance
         return mu, lv
 
+
 class InjectLatent(nn.Module):
-    """Upsample z to feat size, project, then add to feat."""
+    """upsample z to feat size, project, then add to feat"""
     def __init__(self, z_ch: int, feat_ch: int):
         super().__init__()
         self.proj = nn.Conv2d(z_ch, feat_ch, 1)
@@ -53,23 +56,21 @@ class InjectLatent(nn.Module):
             z = F.interpolate(z, size=feat.shape[2:], mode="nearest")
         return feat + self.proj(z)
 
-# ============================================================================
-# 8-SCALE ResUNet ENCODER/DECODER
-# ============================================================================
 
 def _cap(c):
-    """Cap channels at 192 as per paper spec"""
+    """cap channels at 192 as per paper spec"""
     return min(c, 192)
+
 
 class ResUNet8ScaleEncoder(nn.Module):
     """
-    8-scale ResUNet encoder: 128→64→32→16→8→4→2→1
-    Base=24, channels: (24, 48, 96, 192, 192, 192, 192, 192)
+    8-scale ResUNet encoder: 128->64->32->16->8->4->2->1
+    base=24, channels: (24, 48, 96, 192, 192, 192, 192, 192)
     """
     def __init__(self, in_ch: int = 1, base: int = 24, n_blocks: int = 3):
         super().__init__()
         
-        # Channel progression as per paper: base, 2*base, 4*base, 8*base, then capped at 192
+        # channel progression as per paper: base, 2*base, 4*base, 8*base, then capped at 192
         C1 = _cap(base)          # 24
         C2 = _cap(base * 2)      # 48  
         C3 = _cap(base * 4)      # 96
@@ -102,8 +103,9 @@ class ResUNet8ScaleEncoder(nn.Module):
         e8 = self.down7(e7)   # 1x1
         return e1, e2, e3, e4, e5, e6, e7, e8
 
+
 class ResUNet8ScaleDecoder(nn.Module):
-    """8-scale ResUNet decoder: 1→2→4→8→16→32→64→128"""
+    """8-scale ResUNet decoder: 1->2->4->8->16->32->64->128"""
     def __init__(self, chans: tuple, n_blocks: int = 3):
         super().__init__()
         C1, C2, C3, C4, C5, C6, C7, C8 = chans
@@ -125,17 +127,14 @@ class ResUNet8ScaleDecoder(nn.Module):
         d3 = self.up3(d4, e3)  # 16x16 -> 32x32
         d2 = self.up2(d3, e2)  # 32x32 -> 64x64
         d1 = self.up1(d2, e1)  # 64x64 -> 128x128
-        return d1, d2, d3, d4, d5, d6, d7  # Return all decoder features for latent injection
+        return d1, d2, d3, d4, d5, d6, d7  # return all decoder features for latent injection
 
-# ============================================================================
-# MAIN HPUNet MODEL
-# ============================================================================
 
 class HPUNet(nn.Module):
     """
-    8-scale Hierarchical Probabilistic U-Net for LIDC dataset.
-    Latent scales at: 1x1, 2x2, 4x4, 8x8, 16x16, 32x32, 64x64, 128x128.
-    Uses ResUNet backbone with base=24 channels and 3 pre-activated residual blocks per scale.
+    8-scale Hierarchical Probabilistic U-Net for LIDC
+    latent scales at: 1x1, 2x2, 4x4, 8x8, 16x16, 32x32, 64x64, 128x128
+    uses ResUNet backbone with base=24 channels and 3 residual blocks per scale
     """
     def __init__(self, in_ch: int = 1, base: int = 24, z_ch: int = 1, n_blocks: int = 3):
         super().__init__()
@@ -146,10 +145,10 @@ class HPUNet(nn.Module):
         self.enc_xy = ResUNet8ScaleEncoder(in_ch=in_ch + 1, base=base, n_blocks=n_blocks)
         self.dec    = ResUNet8ScaleDecoder(self.enc_x.channels, n_blocks=n_blocks)
         
-        # Channel configuration: (24, 48, 96, 192, 192, 192, 192, 192)
+        # channel config: (24, 48, 96, 192, 192, 192, 192, 192)
         C1, C2, C3, C4, C5, C6, C7, C8 = self.enc_x.channels
 
-        # Prior heads at each latent scale
+        # prior heads at each latent scale
         self.prior_s1   = GaussianParam2d(C8, z_ch)  # 1x1 (global)
         self.prior_s2   = GaussianParam2d(C7, z_ch)  # 2x2  
         self.prior_s4   = GaussianParam2d(C6, z_ch)  # 4x4
@@ -159,7 +158,7 @@ class HPUNet(nn.Module):
         self.prior_s64  = GaussianParam2d(C2, z_ch)  # 64x64
         self.prior_s128 = GaussianParam2d(C1, z_ch)  # 128x128
 
-        # Posterior heads at each latent scale
+        # posterior heads at each latent scale
         self.post_s1    = GaussianParam2d(C8, z_ch)
         self.post_s2    = GaussianParam2d(C7, z_ch)
         self.post_s4    = GaussianParam2d(C6, z_ch)
@@ -169,7 +168,7 @@ class HPUNet(nn.Module):
         self.post_s64   = GaussianParam2d(C2, z_ch)
         self.post_s128  = GaussianParam2d(C1, z_ch)
 
-        # Latent injectors for prior decoder
+        # latent injectors for prior decoder
         self.inj_s1  = InjectLatent(z_ch, C8)  # inject at 1x1
         self.inj_s2  = InjectLatent(z_ch, C7)  # inject at 2x2
         self.inj_s4  = InjectLatent(z_ch, C6)  # inject at 4x4
@@ -179,7 +178,7 @@ class HPUNet(nn.Module):
         self.inj_s64 = InjectLatent(z_ch, C2)  # inject at 64x64
         self.inj_s128 = InjectLatent(z_ch, C1) # inject at 128x128
 
-        # Latent injectors for posterior decoder (for conditioning next scale)
+        # latent injectors for posterior decoder (for conditioning next scale)
         self.pin_s1  = InjectLatent(z_ch, C8)
         self.pin_s2  = InjectLatent(z_ch, C7)
         self.pin_s4  = InjectLatent(z_ch, C6)
@@ -189,45 +188,42 @@ class HPUNet(nn.Module):
         self.pin_s64 = InjectLatent(z_ch, C2)
         self.pin_s128 = InjectLatent(z_ch, C1)
 
-        # Final prediction head
+        # final prediction head
         self.head = nn.Sequential(
             nn.Conv2d(C1, C1, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(C1, 1, 1)  # Binary segmentation
+            nn.Conv2d(C1, 1, 1)  # binary segmentation
         )
 
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights as per paper specification"""
+        """initialize weights like in the paper"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                # Orthogonal initialization with gain=1.0
+                # orthogonal initialization with gain=1.0
                 nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
-                    # Truncated normal with stddev=0.001
+                    # truncated normal with stddev=0.001
                     nn.init.normal_(m.bias, mean=0.0, std=0.001)
 
     def forward(self, x: torch.Tensor,
                 y_target: torch.Tensor | None = None,
                 sample_posterior: bool = True):
         """
-        Forward pass with hierarchical latent sampling.
+        forward pass with hierarchical latent sampling
         
-        Args:
-            x: Input image [B,1,H,W]
-            y_target: Target segmentation [B,1,H,W] (for posterior sampling)
-            sample_posterior: If True and y_target provided, sample from posterior
+        x: input image [B,1,H,W]
+        y_target: target segmentation [B,1,H,W] (for posterior sampling)
+        sample_posterior: if True and y_target provided, sample from posterior
         
-        Returns:
-            logits: Prediction logits [B,1,H,W]
-            info: Dict with KL_sum and all distribution parameters
+        returns: logits [B,1,H,W] and info dict with KL_sum and distribution params
         """
         B = x.size(0)
         
-        # Encode input image
+        # encode input image
         e1, e2, e3, e4, e5, e6, e7, e8 = self.enc_x(x)
 
-        # Encode image+target for posterior if available
+        # encode image+target for posterior if available
         posterior_features = None
         if (y_target is not None) and sample_posterior:
             xy = torch.cat([x, y_target], dim=1)
@@ -236,31 +232,29 @@ class HPUNet(nn.Module):
         info = {}
         KLs = []
 
-        # =================================================================
-        # HIERARCHICAL LATENT SAMPLING (8 SCALES)
-        # =================================================================
+        # hierarchical latent sampling (8 scales)
 
-        # ===================== Scale 1: 1x1 (Global, Deepest) =====================
+        # scale 1: 1x1 (global, deepest)
         mu_p1, lv_p1 = self.prior_s1(e8)
         if posterior_features is not None:
             pe1, pe2, pe3, pe4, pe5, pe6, pe7, pe8 = posterior_features
             mu_q1, lv_q1 = self.post_s1(pe8)
             z1 = mu_q1 + torch.randn_like(mu_q1) * torch.exp(0.5 * lv_q1)
             KLs.append(gaussian_kl_spatial(mu_q1, lv_q1, mu_p1, lv_p1))
-            # Condition posterior features for next scale
+            # condition posterior features for next scale
             pe8_conditioned = self.pin_s1(pe8, z1)
         else:
             z1 = mu_p1 + torch.randn_like(mu_p1) * torch.exp(0.5 * lv_p1)
 
-        # Inject z1 and decode: 1x1 -> 2x2
+        # inject z1 and decode: 1x1 -> 2x2
         e8_with_z1 = self.inj_s1(e8, z1)
         d7 = self.dec.up7(e8_with_z1, e7)
         
-        # Posterior path for next scale
+        # posterior path for next scale
         if posterior_features is not None:
             pd7 = self.dec.up7(pe8_conditioned, pe7)
 
-        # ===================== Scale 2: 2x2 =====================
+        # scale 2: 2x2
         mu_p2, lv_p2 = self.prior_s2(d7)
         if posterior_features is not None:
             mu_q2, lv_q2 = self.post_s2(pd7)
@@ -276,7 +270,7 @@ class HPUNet(nn.Module):
         if posterior_features is not None:
             pd6 = self.dec.up6(pe7_conditioned, pe6)
 
-        # ===================== Scale 4: 4x4 =====================
+        # scale 4: 4x4
         mu_p4, lv_p4 = self.prior_s4(d6)
         if posterior_features is not None:
             mu_q4, lv_q4 = self.post_s4(pd6)
@@ -292,7 +286,7 @@ class HPUNet(nn.Module):
         if posterior_features is not None:
             pd5 = self.dec.up5(pe6_conditioned, pe5)
 
-        # ===================== Scale 8: 8x8 =====================
+        # scale 8: 8x8
         mu_p8, lv_p8 = self.prior_s8(d5)
         if posterior_features is not None:
             mu_q8, lv_q8 = self.post_s8(pd5)
@@ -308,7 +302,7 @@ class HPUNet(nn.Module):
         if posterior_features is not None:
             pd4 = self.dec.up4(pe5_conditioned, pe4)
 
-        # ===================== Scale 16: 16x16 =====================
+        # scale 16: 16x16
         mu_p16, lv_p16 = self.prior_s16(d4)
         if posterior_features is not None:
             mu_q16, lv_q16 = self.post_s16(pd4)
@@ -324,7 +318,7 @@ class HPUNet(nn.Module):
         if posterior_features is not None:
             pd3 = self.dec.up3(pe4_conditioned, pe3)
 
-        # ===================== Scale 32: 32x32 =====================
+        # scale 32: 32x32
         mu_p32, lv_p32 = self.prior_s32(d3)
         if posterior_features is not None:
             mu_q32, lv_q32 = self.post_s32(pd3)
@@ -340,7 +334,7 @@ class HPUNet(nn.Module):
         if posterior_features is not None:
             pd2 = self.dec.up2(pe3_conditioned, pe2)
 
-        # ===================== Scale 64: 64x64 =====================
+        # scale 64: 64x64
         mu_p64, lv_p64 = self.prior_s64(d2)
         if posterior_features is not None:
             mu_q64, lv_q64 = self.post_s64(pd2)
@@ -356,7 +350,7 @@ class HPUNet(nn.Module):
         if posterior_features is not None:
             pd1 = self.dec.up1(pe2_conditioned, pe1)
 
-        # ===================== Scale 128: 128x128 (Final) =====================
+        # scale 128: 128x128 (final)
         mu_p128, lv_p128 = self.prior_s128(d1)
         if posterior_features is not None:
             mu_q128, lv_q128 = self.post_s128(pd1)
@@ -365,21 +359,18 @@ class HPUNet(nn.Module):
         else:
             z128 = mu_p128 + torch.randn_like(mu_p128) * torch.exp(0.5 * lv_p128)
 
-        # Final injection and prediction
+        # final injection and prediction
         d1_final = self.inj_s128(d1, z128)
         logits = self.head(d1_final)
 
-        # =================================================================
-        # AGGREGATE KL LOSS AND STORE INFO (WITH NUMERICAL SAFETY)
-        # =================================================================
-        
+        # aggregate KL loss and store info (with numerical safety)
         if KLs:
-            # Stack and check for numerical issues
+            # stack and check for numerical issues
             kl_stack = torch.stack(KLs, dim=0)
             kl_stack = torch.where(torch.isfinite(kl_stack), kl_stack, torch.zeros_like(kl_stack))
             
-            info["KL_sum"] = kl_stack.sum(0).mean()  # Sum all 8 KL terms
-            # Safe computation of per-scale KL for debugging
+            info["KL_sum"] = kl_stack.sum(0).mean()  # sum all 8 KL terms
+            # safe computation of per-scale KL for debugging
             info["KL_per_scale"] = []
             for i, kl in enumerate(KLs):
                 if torch.isfinite(kl).all():
@@ -390,7 +381,7 @@ class HPUNet(nn.Module):
             info["KL_sum"] = torch.tensor(0.0, device=x.device)
             info["KL_per_scale"] = []
 
-        # Store all distribution parameters for debugging/analysis
+        # store all distribution parameters for debugging
         info.update({
             "mu_p1": mu_p1, "lv_p1": lv_p1, "mu_p2": mu_p2, "lv_p2": lv_p2,
             "mu_p4": mu_p4, "lv_p4": lv_p4, "mu_p8": mu_p8, "lv_p8": lv_p8,

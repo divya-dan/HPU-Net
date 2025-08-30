@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-Standard PU-Net Training Script - reproducing the HPU-Net paper baseline
+Standard PU-Net training script - baseline for HPU-Net paper reproduction
 
-This trains the regular Probabilistic U-Net (sPU-Net) on LIDC data exactly
-like the baseline described in the HPU-Net paper:
-
-- Model: 5-scale U-Net, separate prior/posterior, global z in R^6, 3x1x1 combiner  
-- Loss: ELBO with beta=1 -> loss = recon + KL (no fancy stuff)
-- Reconstruction: sum over pixels, then mean over batch (mask out padded pixels)
+Trains regular Probabilistic U-Net (sPU-Net) on LIDC exactly like the baseline:
+- Model: 5-scale U-Net, separate prior/posterior, global z in R^6, 3x1x1 combiner
+- Loss: ELBO with beta=1 -> loss = recon + KL (no annealing or penalties)
+- Reconstruction: sum over pixels, then mean over batch (mask padded pixels)
 - KL: sum over latent dims, then mean over batch
 - Optimizer: Adam with weight decay, LR schedule from config
 - Batch size: 32, Total steps: 240k (can override with --max-steps)
 
-Note: We don't use GECO, stochastic top-k, beta-annealing, min-KL, or 
-any other fancy stuff here. Just the clean baseline.
+Note: no GECO, stochastic top-k, beta-annealing, min-KL, or other fancy stuff
 """
 from __future__ import annotations
 import argparse
@@ -35,7 +32,7 @@ from hpunet.utils.logger import Logger
 
 
 def set_seed(seed: int):
-    """set random seeds for reproducability"""
+    """set random seeds everywhere for reproducibility"""
     import random
     import numpy as np
     random.seed(seed); np.random.seed(seed)
@@ -44,10 +41,7 @@ def set_seed(seed: int):
 
 
 def auto_pos_weight(y_target: Tensor, pad_mask: Tensor, clip: float = 20.0) -> Optional[Tensor]:
-    """
-    compute per-batch positive-class weight = negatives/positives
-    returns scalar tensor on same device, or None if no positives
-    """
+    """compute per-batch positive-class weight = negatives/positives"""
     valid = pad_mask.float().unsqueeze(1)  # [B,1,H,W]
     n_pos = (y_target * valid).sum()
     n_valid = valid.sum()
@@ -61,10 +55,10 @@ def recon_loss_sum_pixels_mean_batch(
     logits: Tensor, targets: Tensor, pad_mask: Tensor, pos_weight: Optional[Tensor] = None
 ) -> Tensor:
     """
-    Binary cross-entropy with logits, masked properly
+    binary cross-entropy with logits, masked properly
     - per-pixel BCE (no reduction)
     - mask out padded pixels
-    - sum over H×W per sample  
+    - sum over H×W per sample
     - mean over batch
     """
     assert logits.ndim == 4 and logits.size(1) == 1, "logits must be [B,1,H,W]"
@@ -74,23 +68,22 @@ def recon_loss_sum_pixels_mean_batch(
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none", pos_weight=pos_weight)
     mask = pad_mask.unsqueeze(1).to(bce.dtype)  # [B,1,H,W]
     bce = bce * mask
-    
     # sum over pixels per sample, then mean over batch
     per_sample = bce.flatten(1).sum(dim=1)  # [B]
     return per_sample.mean()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Paper-faithful sPUNet training (LIDC)")
-    ap.add_argument("--config", type=Path, required=True, help="Training config JSON file")
-    ap.add_argument("--project-root", type=Path, default=Path.cwd(), help="Project root directory")
-    ap.add_argument("--data-root", type=Path, default=None, help="Data root directory (defaults to <project-root>/data/lidc_crops)")
-    ap.add_argument("--max-steps", type=int, default=None, help="Override total training steps")
-    ap.add_argument("--outdir", type=Path, default=Path("runs/spu_paper_exact"), help="Output directory")
-    ap.add_argument("--save-name", type=str, default="spu_last.pth", help="Final checkpoint filename")
+    ap = argparse.ArgumentParser(description="Standard sPU-Net training script")
+    ap.add_argument("--config", type=Path, required=True, help="training config JSON file")
+    ap.add_argument("--project-root", type=Path, default=Path.cwd(), help="project root directory")
+    ap.add_argument("--data-root", type=Path, default=None, help="data root directory")
+    ap.add_argument("--max-steps", type=int, default=None, help="override total training steps")
+    ap.add_argument("--outdir", type=Path, default=Path("runs/spu_paper_exact"), help="output directory")
+    ap.add_argument("--save-name", type=str, default="spu_last.pth", help="final checkpoint filename")
     args = ap.parse_args()
 
-    # load config and setup
+    # load config and basic setup
     cfg = load_config(args.config)
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -103,7 +96,7 @@ def main():
     data_root = args.data_root or (args.project_root / "data" / "lidc_crops")
     train_csv = data_root / "train.csv"
 
-    # setup data
+    # setup dataset and loader
     train_ds = LIDCCropsDataset(
         csv_path=train_csv,
         project_root=args.project_root,
@@ -122,20 +115,20 @@ def main():
 
     # model setup - paper spec: in_ch=1, base=32, z_dim=6
     model = sPUNet(in_ch=1, base=32, z_dim=6).to(device)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"model has {sum(p.numel() for p in model.parameters()):,} parameters")
 
-    # optimizer & LR schedule (paper uses weight decay everywhere)
+    # optimizer & lr schedule (paper uses weight decay everywhere)
     optimizer = make_optimizer(model.parameters(), cfg)
     scheduler = make_scheduler(optimizer, cfg)
 
-    # target selection strategy: sample one grader per step
+    # target selection strategy
     recon_strategy = str(getattr(cfg, "recon_strategy", "random"))
 
-    # pos weight handling (set cfg.pos_weight to "none" to disable)
+    # pos weight handling
     posw_mode = getattr(cfg, "pos_weight", "auto")
     posw_clip = float(getattr(cfg, "pos_weight_clip", 20.0))
 
-    # for saving config into checkpoints
+    # prep config for saving
     if is_dataclass(cfg):
         cfg_to_save: Dict[str, Any] = asdict(cfg)
     elif isinstance(cfg, dict):
@@ -146,15 +139,15 @@ def main():
     # logger setup
     logger = Logger(args.outdir, use_tensorboard=True)
 
-    print("Starting sPUNet training (paper baseline):")
-    print(f"  Steps: {max_steps:,}")
-    print(f"  Batch size: {cfg.batch_size}")
-    print(f"  LR start: {cfg.lr} | WD: {cfg.weight_decay}")
-    print(f"  Dataset size: {len(train_ds)}")
+    print("starting sPU-Net training (paper baseline):")
+    print(f"  total steps: {max_steps:,}")
+    print(f"  batch size: {cfg.batch_size}")
+    print(f"  initial lr: {cfg.lr} | weight decay: {cfg.weight_decay}")
+    print(f"  dataset size: {len(train_ds)}")
 
     model.train()
     data_iter = iter(train_loader)
-    run_loss = run_recon = run_kl = 0.0
+    running = {"loss": 0.0, "recon": 0.0, "kl": 0.0}
 
     for step in range(1, max_steps + 1):
         # get next batch
@@ -168,7 +161,7 @@ def main():
         y_all = batch["masks"].to(device, non_blocking=True)     # [B,4,H,W]
         pm = batch["pad_mask"].to(device, non_blocking=True)     # [B,H,W] (bool)
 
-        # pick one target grader mask
+        # select target grader mask
         y_target, _sel = select_targets_from_graders(y_all, strategy=recon_strategy)
 
         # forward pass: use posterior during training
@@ -197,16 +190,16 @@ def main():
         # paper ELBO (beta=1)
         loss = recon + kl_val
 
-        # backprop
+        # backprop step
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
         scheduler.step()
 
         # track running losses
-        run_loss += float(loss)
-        run_recon += float(recon)
-        run_kl += float(kl_val)
+        running["loss"] += float(loss)
+        running["recon"] += float(recon)
+        running["kl"] += float(kl_val)
 
         logger.log_scalars(step, {
             "train/loss": float(loss),
@@ -219,9 +212,11 @@ def main():
         if step % 100 == 0:
             n = 100.0
             print(
-                f"[step {step:5d}] loss={run_loss/n:.4f}  recon={run_recon/n:.4f}  kl={run_kl/n:.4f}  lr={optimizer.param_groups[0]['lr']:.6g}"
+                f"[step {step:5d}] loss={running['loss']/n:.4f} | "
+                f"recon={running['recon']/n:.4f} | kl={running['kl']/n:.4f} | "
+                f"lr={optimizer.param_groups[0]['lr']:.6g}"
             )
-            run_loss = run_recon = run_kl = 0.0
+            running = {"loss": 0.0, "recon": 0.0, "kl": 0.0}
 
         # save checkpoint periodically
         if step % ckpt_every_steps == 0:
@@ -233,9 +228,9 @@ def main():
                 "scheduler": scheduler.state_dict(),
                 "cfg": cfg_to_save,
             }, ckpt_path)
-            print(f"Checkpoint saved at step {step}: {ckpt_path}")
+            print(f"saved checkpoint at step {step}: {ckpt_path}")
 
-        # eval placeholder (could add validation here)
+        # eval placeholder
         if step % eval_every_steps == 0:
             pass
 
@@ -248,7 +243,7 @@ def main():
         "scheduler": scheduler.state_dict(),
         "cfg": cfg_to_save,
     }, ckpt_path)
-    print(f"Final checkpoint saved to: {ckpt_path}")
+    print(f"training complete! final checkpoint: {ckpt_path}")
 
 
 if __name__ == "__main__":

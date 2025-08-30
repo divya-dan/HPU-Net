@@ -1,13 +1,13 @@
 """
-Paper-faithful sPU-Net (Probabilistic U-Net) for LIDC
------------------------------------------------------------------
-- 5-scale standard U-Net (no BatchNorm), 3×(3×3 conv + ReLU) per scale
-- Bilinear downsampling/upsampling between scales
+Standard Probabilistic U-Net for LIDC dataset
+
+- 5-scale U-Net (no BatchNorm), 3x(3x3 conv + ReLU) per scale
+- Bilinear downsampling/upsampling between scales  
 - Separate prior and posterior networks that mirror the encoder
-- Single global latent vector z ∈ R^6
-- Latent is broadcast and concatenated with decoder features
-- Combiner: three 1×1 conv layers → logits (no sigmoid)
-- Weight init: orthogonal weights, truncated-normal biases (σ=1e-3)
+- Single global latent vector z in R^6
+- Latent gets broadcast and concatenated with decoder features
+- Combiner: three 1x1 conv layers -> logits (no sigmoid)
+- Weight init: orthogonal weights, truncated-normal biases (sigma=1e-3)
 - Forward returns (logits, info) with per-sample KL (sum over z-dims)
 """
 from __future__ import annotations
@@ -18,11 +18,8 @@ from torch import nn
 import torch.nn.functional as F
 
 
-# -----------------------------------------------------------------------------
-# Utils
-# -----------------------------------------------------------------------------
-
 def _truncated_normal_(tensor: torch.Tensor, std: float = 1e-3, a: float = -2.0, b: float = 2.0) -> None:
+    """initialize with truncated normal distribution"""
     with torch.no_grad():
         tensor.normal_(mean=0.0, std=std)
         tensor.clamp_(a * std, b * std)
@@ -30,17 +27,15 @@ def _truncated_normal_(tensor: torch.Tensor, std: float = 1e-3, a: float = -2.0,
 
 def gaussian_kl(mu_q: torch.Tensor, logvar_q: torch.Tensor,
                 mu_p: torch.Tensor, logvar_p: torch.Tensor) -> torch.Tensor:
+    """KL divergence between two Gaussians, summed over latent dims"""
     var_q = torch.exp(logvar_q)
     var_p = torch.exp(logvar_p)
     kl = 0.5 * ((logvar_p - logvar_q) + (var_q + (mu_q - mu_p) ** 2) / (var_p + 1e-8) - 1.0)
     return kl.sum(dim=1)
 
 
-# -----------------------------------------------------------------------------
-# Paper-faithful Conv Blocks (3×3 conv + ReLU, bias=True)
-# -----------------------------------------------------------------------------
-
 class ConvBlock(nn.Module):
+    """basic conv block: 3x(3x3 conv + ReLU), bias=True"""
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=True)
@@ -56,6 +51,7 @@ class ConvBlock(nn.Module):
 
 
 class Encoder(nn.Module):
+    """5-scale encoder with bilinear downsampling"""
     def __init__(self, in_ch: int, base: int = 32):
         super().__init__()
         self.enc1 = ConvBlock(in_ch, base)
@@ -63,7 +59,7 @@ class Encoder(nn.Module):
         self.enc3 = ConvBlock(base*2, base*4)
         self.enc4 = ConvBlock(base*4, base*8)
         self.enc5 = ConvBlock(base*8, base*16)
-        # (downsampling via bilinear interpolation in forward)
+        # downsampling via bilinear interpolation in forward pass
         self.channels = [base, base*2, base*4, base*8, base*16]
 
     def forward(self, x: torch.Tensor):
@@ -76,6 +72,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
+    """5-scale decoder with skip connections"""
     def __init__(self, channels):
         super().__init__()
         C1, C2, C3, C4, C5 = channels
@@ -97,11 +94,8 @@ class Decoder(nn.Module):
         return d1
 
 
-# -----------------------------------------------------------------------------
-# Prior & Posterior Networks
-# -----------------------------------------------------------------------------
-
 class PriorNet(nn.Module):
+    """prior network: encodes input x to get p(z|x)"""
     def __init__(self, in_ch: int, base: int, z_dim: int):
         super().__init__()
         self.encoder = Encoder(in_ch=in_ch, base=base)
@@ -119,9 +113,10 @@ class PriorNet(nn.Module):
 
 
 class PosteriorNet(nn.Module):
+    """posterior network: encodes input+target to get q(z|x,y)"""
     def __init__(self, in_ch: int, base: int, z_dim: int):
         super().__init__()
-        self.encoder = Encoder(in_ch=in_ch + 1, base=base)
+        self.encoder = Encoder(in_ch=in_ch + 1, base=base)  # +1 for target mask
         C1, C2, C3, C4, C5 = self.encoder.channels
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.mu_head = nn.Conv2d(C5, z_dim, kernel_size=1, bias=True)
@@ -135,11 +130,8 @@ class PosteriorNet(nn.Module):
         return mu, logvar
 
 
-# -----------------------------------------------------------------------------
-# Combiner
-# -----------------------------------------------------------------------------
-
 class Combiner(nn.Module):
+    """combines decoder features with latent z to produce final logits"""
     def __init__(self, dec_ch: int, z_dim: int):
         super().__init__()
         self.combine = nn.Sequential(
@@ -152,16 +144,14 @@ class Combiner(nn.Module):
 
     def forward(self, dec_feat: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         B, C, H, W = dec_feat.shape
+        # broadcast z to spatial dimensions
         z_b = z.view(B, -1, 1, 1).expand(B, z.size(1), H, W)
         x = torch.cat([dec_feat, z_b], dim=1)
         return self.combine(x)
 
 
-# -----------------------------------------------------------------------------
-# sPU-Net main module
-# -----------------------------------------------------------------------------
-
 class sPUNet(nn.Module):
+    """standard Probabilistic U-Net implementation"""
     def __init__(self, in_ch: int = 1, base: int = 32, z_dim: int = 6):
         super().__init__()
         self.z_dim = z_dim
@@ -173,6 +163,7 @@ class sPUNet(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        """orthogonal weights, truncated normal biases"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.orthogonal_(m.weight, gain=1.0)
@@ -184,11 +175,15 @@ class sPUNet(nn.Module):
                     _truncated_normal_(m.bias, std=1e-3)
 
     def forward(self, x: torch.Tensor, y_target: Optional[torch.Tensor] = None, sample_posterior: bool = True) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """forward pass with optional posterior sampling"""
+        # encode input
         e1, e2, e3, e4, e5 = self.encoder(x)
         dec_feat = self.decoder(e1, e2, e3, e4, e5)
 
+        # always compute prior
         mu_p, logvar_p = self.prior(x)
 
+        # compute posterior if target is available and we want to sample from it
         mu_q = logvar_q = None
         if (y_target is not None) and sample_posterior:
             xy = torch.cat([x, y_target], dim=1)
@@ -196,11 +191,14 @@ class sPUNet(nn.Module):
             std_q = torch.exp(0.5 * logvar_q)
             z = mu_q + torch.randn_like(std_q) * std_q
         else:
+            # sample from prior
             std_p = torch.exp(0.5 * logvar_p)
             z = mu_p + torch.randn_like(std_p) * std_p
 
+        # combine decoder features with latent
         logits = self.combiner(dec_feat, z)
 
+        # compute KL if we used posterior
         if (mu_q is not None) and (logvar_q is not None):
             kl = gaussian_kl(mu_q, logvar_q, mu_p, logvar_p)
         else:

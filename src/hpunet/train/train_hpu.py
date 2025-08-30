@@ -1,3 +1,14 @@
+#!/usr/bin/env python3
+"""
+HPU-Net training script - full method implementation
+
+Trains the Hierarchical Probabilistic U-Net on LIDC with all the features:
+- Model: hierarchical latents with multi-scale structure
+- Loss: GECO-constrained ELBO with stochastic top-k reconstruction
+- GECO: maintains lagrange multiplier to keep reconstruction around target
+- Top-k: focuses on hardest pixels using Gumbel-Softmax sampling
+- Optimizer: Adam with weight decay, LR schedule from config
+"""
 from __future__ import annotations
 import argparse, time
 from pathlib import Path
@@ -19,7 +30,7 @@ from dataclasses import is_dataclass, asdict
 
 
 def auto_pos_weight(y_target: torch.Tensor, pad_mask: torch.Tensor, clip: float = 20.0) -> torch.Tensor | None:
-    """per-batch positive-class weight for BCE (negatives / positives)"""
+    """compute per-batch positive-class weight = negatives/positives"""
     valid = pad_mask.float().unsqueeze(1)  # [B,1,H,W]
     n_pos = (y_target * valid).sum()
     n_valid = valid.sum()
@@ -35,7 +46,7 @@ def masked_bce_sum_per_image(
     """
     return (sum_i, count_i) where:
       sum_i   = per-image SUM of BCE over valid pixels [B]
-      count_i = per-image COUNT of valid pixels (for reporting) [B]
+      count_i = per-image COUNT of valid pixels [B]
     """
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none", pos_weight=pos_weight).squeeze(1)  # [B,H,W]
     valid = pad_mask.bool()
@@ -53,15 +64,16 @@ def set_seed(seed: int):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=Path, required=True)
-    ap.add_argument("--project-root", type=Path, default=Path.cwd())
-    ap.add_argument("--data-root", type=Path, default=None)
-    ap.add_argument("--max-steps", type=int, default=None)  # uses config value if not specified
-    ap.add_argument("--outdir", type=Path, default=Path("runs/hpu"))
-    ap.add_argument("--save-name", type=str, default="hpu_last.pth")
+    ap = argparse.ArgumentParser(description="HPU-Net training script")
+    ap.add_argument("--config", type=Path, required=True, help="training config JSON file")
+    ap.add_argument("--project-root", type=Path, default=Path.cwd(), help="project root directory")
+    ap.add_argument("--data-root", type=Path, default=None, help="data root directory")
+    ap.add_argument("--max-steps", type=int, default=None, help="override total training steps")
+    ap.add_argument("--outdir", type=Path, default=Path("runs/hpu"), help="output directory")
+    ap.add_argument("--save-name", type=str, default="hpu_last.pth", help="final checkpoint filename")
     args = ap.parse_args()
 
+    # load config and basic setup
     cfg = load_config(args.config)
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,7 +87,7 @@ def main():
     data_root = args.data_root or (args.project_root / "data" / "lidc_crops")
     train_csv = data_root / "train.csv"
 
-    # setup data loader
+    # setup dataset and loader
     train_ds = LIDCCropsDataset(
         csv_path=train_csv, project_root=args.project_root,
         image_size=128, augment=cfg.augment, seed=cfg.seed
@@ -83,8 +95,9 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
                               num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
 
-    # model with correct params and weight init
+    # model setup - paper spec
     model = HPUNet(in_ch=1, base=24, z_ch=1).to(device)  # z_ch=1 for scalar latents
+    print(f"model has {sum(p.numel() for p in model.parameters()):,} parameters")
 
     # GECO setup with paper defaults
     gcfg = cfg.geco if hasattr(cfg, 'geco') and cfg.geco else {
@@ -95,6 +108,7 @@ def main():
     }
     geco = GECO(GECOConfig(**gcfg)).to(device)
 
+    # optimizer & lr schedule
     optimizer = make_optimizer(model.parameters(), cfg)
     scheduler = make_scheduler(optimizer, cfg)
 
@@ -104,7 +118,7 @@ def main():
     posw_clip = float(getattr(cfg, "pos_weight_clip", 20.0))
     recon_strategy = getattr(cfg, "recon_strategy", "random")
 
-    # prep config for saving (used in checkpoints)
+    # prep config for saving
     if is_dataclass(cfg):
         cfg_to_save = asdict(cfg)
     elif isinstance(cfg, dict):
@@ -112,13 +126,23 @@ def main():
     else:
         cfg_to_save = vars(cfg)
 
-    running = {"L": 0.0, "recon_pp": 0.0, "recon_sum": 0.0, "kl": 0.0, "lam": 0.0, "C": 0.0, "Cbar": 0.0}
+    # logger setup
     logger = Logger(args.outdir, use_tensorboard=True)
+
+    print("starting HPU-Net training:")
+    print(f"  total steps: {max_steps:,}")
+    print(f"  batch size: {cfg.batch_size}")
+    print(f"  initial lr: {cfg.lr} | weight decay: {cfg.weight_decay}")
+    print(f"  dataset size: {len(train_ds)}")
+    print(f"  using {'stochastic top-k' if use_topk else 'standard BCE'} reconstruction")
+
+    running = {"L": 0.0, "recon_pp": 0.0, "recon_sum": 0.0, "kl": 0.0, "lam": 0.0, "C": 0.0, "Cbar": 0.0}
 
     model.train()
     data_iter = iter(train_loader)
     
     for step in range(1, int(max_steps) + 1):
+        # get next batch
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -129,7 +153,7 @@ def main():
         y_all = batch["masks"].to(device, non_blocking=True)    # [B,4,H,W]
         pm = batch["pad_mask"].to(device, non_blocking=True)    # [B,H,W]
 
-        # choose target grader
+        # select target grader
         y_target, target_info = select_targets_from_graders(y_all, strategy=recon_strategy)
 
         # forward with posterior sampling (training mode)
@@ -185,7 +209,7 @@ def main():
         optimizer.step()
         scheduler.step()
 
-        # logging stuff
+        # track running losses
         lr = optimizer.param_groups[0]["lr"]
         logger.log_scalars(step, {
             "train/L": float(loss),
@@ -199,7 +223,6 @@ def main():
             "train/valid_pix_mean": float(valid_pix_mean),
         })
 
-        # running averages for console output
         running["L"]       += float(loss)
         running["recon_pp"]+= float(recon_pp)
         running["recon_sum"]+= float(recon_sum_mean)
@@ -208,17 +231,18 @@ def main():
         running["C"]       += float(ge["C"])
         running["Cbar"]    += float(ge["C_bar"])
 
+        # print progress every 100 steps
         if step % 100 == 0:
             n = 100.0
             print(
-                f"[step {step:5d}] L={running['L']/n:.4f}  "
-                f"recon_pp={running['recon_pp']/n:.4f}  recon_sum={running['recon_sum']/n:.4f}  "
-                f"kl={running['kl']/n:.4f}  lam={running['lam']/n:.3f}  "
-                f"C={running['C']/n:.4f}  CÌ„={running['Cbar']/n:.4f}  lr={lr:.6g}"
+                f"[step {step:5d}] L={running['L']/n:.4f} | "
+                f"recon_pp={running['recon_pp']/n:.4f} | recon_sum={running['recon_sum']/n:.4f} | "
+                f"kl={running['kl']/n:.4f} | lam={running['lam']/n:.3f} | "
+                f"C={running['C']/n:.4f} | C_bar={running['Cbar']/n:.4f} | lr={lr:.6g}"
             )
             running = {"L": 0.0, "recon_pp": 0.0, "recon_sum": 0.0, "kl": 0.0, "lam": 0.0, "C": 0.0, "Cbar": 0.0}
 
-        # save checkpoints periodically  
+        # save checkpoint periodically
         if step % ckpt_every_steps == 0:
             ckpt_path = args.outdir / f"hpu_step_{step}.pth"
             torch.save({
@@ -233,12 +257,11 @@ def main():
                 "scheduler": scheduler.state_dict(),
                 "cfg": cfg_to_save
             }, ckpt_path)
-            print(f"Checkpoint saved at step {step}: {ckpt_path}")
+            print(f"saved checkpoint at step {step}: {ckpt_path}")
 
-        # eval placeholder (could add validation here)
+        # eval placeholder
         if step % eval_every_steps == 0:
-            print(f"[step {step:5d}] Evaluation placeholder (add validation logic here)")
-            # TODO: add validation loop here if you have validation data
+            print(f"[step {step:5d}] eval placeholder (add validation here)")
 
     # save final checkpoint
     ckpt_path = args.outdir / args.save_name
@@ -254,7 +277,7 @@ def main():
         "scheduler": scheduler.state_dict(),
         "cfg": cfg_to_save
     }, ckpt_path)
-    print(f"Final checkpoint saved to: {ckpt_path}")
+    print(f"training complete! final checkpoint: {ckpt_path}")
     logger.close()
 
 
