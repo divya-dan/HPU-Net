@@ -55,21 +55,21 @@ jupyter notebook src/hpunet/eval/spu_hpu_eval_compare.ipynb
 
 Reproduction results on LIDC-IDRI dataset comparing our implementation with original paper metrics:
 
-**Case 1 - All samples (including empty masks):**
+**Case 1 - All samples (including empty masks; sPU=1980, HPU=1980):**
+
+| Model   | GED²                | IoUrec            | Hungarian         |
+|---------|---------------------|-------------------|-------------------|
+| sPU-Net | 0.444±0.376         | 0.759±0.154       | 0.466±0.234       |
+|         | (paper: 0.32±0.03)  | (paper: 0.75±0.04)| (paper: 0.50±0.03)|
+| HPU-Net | 0.394±0.289         | 0.949±0.070       | 0.498±0.198       |
+|         | (paper: 0.27±0.01)  | (paper: 0.97±0.00)| (paper: 0.53±0.01)|
+
+**Case 2 - Lesions only (excluding empty masks; sPU=1980, HPU=1980):**
 
 | Model   | GED²            | IoUrec          | Hungarian       |
 |---------|-----------------|-----------------|-----------------|
-| sPU-Net | 0.176±0.169     | 0.759±0.153     | 0.465±0.236     |
-|         | (paper: 0.32±0.03) | (paper: 0.75±0.04) | (paper: 0.50±0.03) |
-| HPU-Net | 0.022±0.024     | 0.958±0.043     | 0.489±0.229     |
-|         | (paper: 0.27±0.01) | (paper: 0.97±0.00) | (paper: 0.53±0.01) |
-
-**Case 2 - Lesions only (excluding empty masks):**
-
-| Model   | GED²            | IoUrec          | Hungarian       |
-|---------|-----------------|-----------------|-----------------|
-| sPU-Net | 0.636±0.560     | 0.563±0.264     | 0.160±0.192     |
-| HPU-Net | 0.109±0.211     | 0.919±0.108     | 0.176±0.186     |
+| sPU-Net | 1.132±0.548     | 0.561±0.267     | 0.161±0.191     |
+| HPU-Net | 0.890±0.500     | 0.941±0.057     | 0.272±0.223     |
 
 <p align="center">
     <img src="./evaluation_results/comparison_animation.gif" alt="Evaluation comparison of SPUnet and HPUnet" width="1000"/>
