@@ -1,96 +1,84 @@
-# HPU-Net
-I reproduce a result from the paper "A Hierarchical Probabilistic U-Net for Modeling Multi-Scale Ambiguities"
+# HPU-Net Reproduction
 
-python train_hpu.py \
-    --config train_hpu_lidc.json \
-    --project-root . \
-    --data-root data/lidc_crops \
-    --outdir runs/hpu \
-    --max-steps 240000
+This project reproduces Figure 2 from the [Hierarchical Probabilistic U-Net](https://arxiv.org/abs/1905.13077) paper, which compares the performance of [sPU-Net](https://arxiv.org/abs/1806.05034) and HPU-Net models on medical image segmentation with uncertainty modeling. The reproduction uses the LIDC-IDRI lung lesion dataset, available from Kohl et al. at this [Google Cloud Storage bucket](https://console.cloud.google.com/storage/browser/hpunet-data/lidc_crops/).
 
 
+## Setup
 
-  {
-  "seed": 42,
-  "total_steps": 240000,
-  "batch_size": 32,
-  "lr": 0.0001,
-  "lr_milestones": [60000, 120000, 180000, 210000],
-  "lr_gamma": 0.5,
-  "optimizer": "adam",
-  "weight_decay": 0.00001,
-  "use_topk": true,
-  "k_frac": 0.02,
-  "recon_strategy": "random",
-  "geco": { 
-    "kappa": 0.05, 
-    "alpha": 0.99, 
-    "lambda_init": 1.0, 
-    "step_size": 0.01 
-  },
-  "eval_every_steps": 5000,
-  "ckpt_every_steps": 10000,
-  "num_workers": 4,
-  "augment": true
-}
+```bash
+conda create -n hpu python=3.12
+conda activate hpu
+pip install -r requirements.txt
+export PYTHONPATH="$PROJECT_DIR/src:${PYTHONPATH:-}"
+```
 
-python evaluate_hpu.py \
-    --checkpoint runs/hpu/hpu_last.pth \
-    --config train_hpu_lidc.json \
-    --data-root data/lidc_crops \
-    --output-dir hpu_evaluation_results \
-    --num-examples 5 \
-    --num-samples 24
+## Data Preparation
 
+Build CSV manifests:
+```bash
+python src/scripts/build_manifests.py \
+  --data-root /path/to/lidc_crops \
+  --out /path/to/lidc_crops \
+  --project-root /path/to/project \
+  --splits train val test
+```
 
+## Training
 
+### HPU-Net
+```bash
+python src/hpunet/train/train_hpu.py \
+  --config configs/train_hpu_lidc.json \
+  --project-root /path/to/project \
+  --data-root /path/to/lidc_crops \
+  --outdir /path/to/output \
+  --max-steps 240000
+```
 
+### sPU-Net
+```bash
+python src/hpunet/train/train_spu.py \
+  --config configs/train_spu_lidc.json \
+  --project-root /path/to/project \
+  --data-root /path/to/lidc_crops \
+  --outdir /path/to/output \
+  --max-steps 240000
+```
 
+## Evaluation
 
+```bash
+jupyter notebook src/hpunet/eval/spu_hpu_eval_compare.ipynb
+```
 
-##################################################
+## Results
 
+Reproduction results on LIDC-IDRI dataset comparing our implementation with original paper metrics:
 
-python train_spu.py \
-    --config train_spu_lidc.json \
-    --project-root . \
-    --data-root data/lidc_crops \
-    --outdir runs/spu \
-    --max-steps 240000
+**Case 1 - All samples (including empty masks):**
 
+| Model   | GED²            | IoUrec          | Hungarian       |
+|---------|-----------------|-----------------|-----------------|
+| sPU-Net | 0.176±0.169     | 0.759±0.153     | 0.465±0.236     |
+|         | (paper: 0.32±0.03) | (paper: 0.75±0.04) | (paper: 0.50±0.03) |
+| HPU-Net | 0.022±0.024     | 0.958±0.043     | 0.489±0.229     |
+|         | (paper: 0.27±0.01) | (paper: 0.97±0.00) | (paper: 0.53±0.01) |
 
+**Case 2 - Lesions only (excluding empty masks):**
 
-{
-  "seed": 42,
-  "total_steps": 240000,
-  "batch_size": 32,
-  "lr": 0.00005,
-  "lr_milestones": [48000, 96000, 144000, 192000, 216000],
-  "lr_gamma": 0.5,
-  "optimizer": "adam",
-  "weight_decay": 0.00001,
-  "beta": 1.0,
-  "use_topk": false,
-  "recon_strategy": "random",
-  "eval_every_steps": 5000,
-  "ckpt_every_steps": 10000,
-  "num_workers": 4,
-  "augment": true,
-  "pos_weight": "auto",
-  "pos_weight_clip": 20.0
-}    
+| Model   | GED²            | IoUrec          | Hungarian       |
+|---------|-----------------|-----------------|-----------------|
+| sPU-Net | 0.636±0.560     | 0.563±0.264     | 0.160±0.192     |
+| HPU-Net | 0.109±0.211     | 0.919±0.108     | 0.176±0.186     |
 
+<p align="center">
+    <img src="./evaluation_results/comparative_row_00000.png" alt="Evaluation comparison of SPUnet and HPUnet" width="500"/>
+</p>
+<p align="center">
+    <em>Evaluation comparison of SPUnet and HPUnet.</em>
+</p>
 
-
-python evaluate_spu.py \
-    --checkpoint runs/spu/spu_last.pth \
-    --config train_spu_lidc.json \
-    --data-root data/lidc_crops \
-    --output-dir spu_evaluation_results \
-    --num-examples 5 \
-    --num-samples 24
+## Acknowledgment
 
 
-
-  Key Model Differences
-ComponentHPUNetsPUNetArchitecture8-scale ResUNet, 8 hierarchical latents5-scale standard U-Net, 6 global latentsLossGECO (κ=0.05) + Stochastic top-kELBO (β=1.0) + Standard BCELearning Rate1×10⁻⁴ → 0.5×10⁻⁵ (4 steps)0.5×10⁻⁵ → 1×10⁻⁶ (5 steps)Prior NetworkUses U-Net featuresSeparate network
+We thank S. A. A. Kohl et al. for their [Probabilistic U-Net](https://arxiv.org/abs/1806.05034) (Kohl et al., 2018) and [Hierarchical Probabilistic U-Net](https://arxiv.org/abs/1905.13077) (Kohl et al., 2019) papers. We acknowledge the LIDC-IDRI dataset (Armato et al., 2011; Clark et al., 2013) and thank Kohl et al. for making the preprocessed dataset publicly available through their [Google Cloud Storage bucket](https://console.cloud.google.com/storage/browser/hpunet-data/lidc_crops/).
