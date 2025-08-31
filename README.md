@@ -72,7 +72,7 @@ Reproduction results on LIDC-IDRI dataset comparing our implementation with orig
 | HPU-Net | 0.109±0.211     | 0.919±0.108     | 0.176±0.186     |
 
 <p align="center">
-    <img src="./evaluation_results/comparative_row_00000.png" alt="Evaluation comparison of SPUnet and HPUnet" width="500"/>
+    <img src="./evaluation_results/comparison_animation.gif" alt="Evaluation comparison of SPUnet and HPUnet" width="500"/>
 </p>
 <p align="center">
     <em>Evaluation comparison of SPUnet and HPUnet.</em>
