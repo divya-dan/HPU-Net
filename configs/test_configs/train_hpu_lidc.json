@@ -1,0 +1,24 @@
+{
+  "seed": 42,
+  "total_steps": 200,
+  "batch_size": 8,
+  "lr": 1e-4,
+  "lr_milestones": [50, 100, 150],
+  "lr_gamma": 0.5,
+  "optimizer": "adam",
+  "weight_decay": 1e-5,
+  "use_topk": true,
+  "k_frac": 0.02,
+  "stochastic_topk": true,
+  "geco": {
+    "kappa": 0.05,
+    "alpha": 0.99,
+    "lambda_init": 1.0,
+    "step_size": 0.01
+  },
+  "pos_weight": "auto",
+  "pos_weight_clip": 20.0,
+  "recon_strategy": "random",
+  "augment": true,
+  "num_workers": 4
+}

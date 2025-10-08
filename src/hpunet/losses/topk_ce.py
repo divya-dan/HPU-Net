@@ -4,41 +4,6 @@ import torch
 import torch.nn.functional as F
 
 
-# returns per-image SUMS (shape [B]) and per-image COUNTS (shape [B])
-def masked_bce_sum_per_image(logits, target, pad_mask, pos_weight=None):
-    # logits,target: [B,1,H,W]; pad_mask: [B,H,W] (bool/byte)
-    bce = F.binary_cross_entropy_with_logits(
-        logits, target, reduction='none', pos_weight=pos_weight
-    ).squeeze(1)                                   # [B,H,W]
-    valid = pad_mask.bool()
-    sums  = (bce * valid).flatten(1).sum(dim=1)    # [B]
-    counts= valid.flatten(1).sum(dim=1)            # [B]
-    return sums, counts
-
-
-def masked_topk_bce_sum_per_image(logits, target, pad_mask, k_frac=0.02, pos_weight=None):
-    """get the top-k hardest pixels for each image"""
-    bce = F.binary_cross_entropy_with_logits(
-        logits, target, reduction='none', pos_weight=pos_weight
-    ).squeeze(1)                                   # [B,H,W]
-    valid = pad_mask.bool()
-    B, H, W = bce.shape
-    sums  = logits.new_zeros(B)
-    counts= torch.zeros(B, dtype=torch.long, device=logits.device)
-    
-    for i in range(B):
-        v = valid[i].view(-1)
-        n = v.sum().item()
-        if n == 0:
-            continue
-        k = max(1, int(round(k_frac * n)))
-        vals = bce[i].view(-1)[v]
-        topk = torch.topk(vals, k, largest=True).values
-        sums[i]   = topk.sum()
-        counts[i] = k
-    return sums, counts
-
-
 def _ensure_mask_dims(mask: torch.Tensor, target_ndim: int) -> torch.Tensor:
     """expand pad_mask [B,H,W] or [H,W] to match per-pixel loss dims"""
     while mask.dim() < target_ndim:
@@ -50,6 +15,7 @@ def _sample_gumbel(shape: torch.Size, device: torch.device, eps: float = 1e-20) 
     """sample from Gumbel(0, 1) distribution"""
     u = torch.rand(shape, device=device)
     return -torch.log(-torch.log(u + eps) + eps)
+
 
 
 def masked_stochastic_topk_bce_with_logits(
@@ -114,33 +80,6 @@ def masked_bce_with_logits(
     return loss.sum() / denom
 
 
-def masked_topk_bce_with_logits(
-    logits: torch.Tensor,          # [B,1,H,W] or [B,H,W]
-    targets: torch.Tensor,         # same spatial shape as logits
-    pad_mask: torch.Tensor,        # [B,H,W] or [H,W] boolean
-    k_frac: float = 0.02,          # keep top 2% pixels by loss
-    pos_weight: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    compute per-pixel BCE, mask invalid pixels, then average the top-k fraction
-    """
-    loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none", pos_weight=pos_weight)
-    mask = _ensure_mask_dims(pad_mask.to(dtype=loss.dtype, device=loss.device), loss.dim())
-    loss = loss * mask
-
-    # flatten everything
-    flat = loss.reshape(-1)
-    flat_mask = mask.reshape(-1) > 0
-    valid_vals = flat[flat_mask]
-    n = valid_vals.numel()
-    if n == 0:
-        return flat.sum() * 0.0
-
-    k = max(1, int(n * float(k_frac)))
-    topk_vals, _ = torch.topk(valid_vals, k)
-    return topk_vals.mean()
-
-
 def compute_pos_weight_from_batch(targets: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
     """compute positive weight for BCE based on class imbalance in this batch"""
     # targets: [B,1,H,W] (0/1), pad_mask: [B,H,W]
@@ -152,13 +91,13 @@ def compute_pos_weight_from_batch(targets: torch.Tensor, pad_mask: torch.Tensor)
 
 
 def make_recon_loss(
-        logits: torch.Tensor,
-        y_target: torch.Tensor,
-        pad_mask: torch.Tensor,
-        use_topk: bool,
-        k_frac: float = 0.02,
-        stochastic_topk: bool = True,  # use stochastic top-k as in paper
-    ) -> torch.Tensor:
+    logits: torch.Tensor,
+    y_target: torch.Tensor,
+    pad_mask: torch.Tensor,
+    use_topk: bool,
+    k_frac: float = 0.02,
+    stochastic_topk: bool = True,  # use stochastic top-k as in paper
+) -> torch.Tensor:
     """main reconstruction loss function - can use regular BCE or top-k variants"""
     pos_w = compute_pos_weight_from_batch(y_target, pad_mask)
     

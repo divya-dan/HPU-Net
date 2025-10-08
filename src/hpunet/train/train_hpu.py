@@ -12,7 +12,7 @@ Trains the Hierarchical Probabilistic U-Net on LIDC with all the features:
 from __future__ import annotations
 import argparse, time
 from pathlib import Path
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 
 import torch
 from torch.utils.data import DataLoader
@@ -26,7 +26,6 @@ from hpunet.losses.geco import GECO, GECOConfig
 from hpunet.models.hpu_net import HPUNet
 from hpunet.losses.topk_ce import make_recon_loss
 from hpunet.utils.logger import Logger
-from dataclasses import is_dataclass, asdict
 
 
 def auto_pos_weight(y_target: torch.Tensor, pad_mask: torch.Tensor, clip: float = 20.0) -> torch.Tensor | None:

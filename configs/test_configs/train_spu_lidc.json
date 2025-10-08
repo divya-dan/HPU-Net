@@ -1,0 +1,16 @@
+{
+  "seed": 42,
+  "total_steps": 200,
+  "batch_size": 8,
+  "lr": 5e-6,
+  "lr_milestones": [50, 100, 150],
+  "lr_gamma": 0.5,
+  "optimizer": "adam",
+  "weight_decay": 1e-5,
+  "use_topk": false,
+  "pos_weight": "auto",
+  "pos_weight_clip": 20.0,
+  "recon_strategy": "random",
+  "augment": true,
+  "num_workers": 4
+}
